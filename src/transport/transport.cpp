@@ -11,10 +11,12 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
+#include "metrics/alloc_gate.h"
 #include "transport/frame.h"
 
 namespace rsm::transport {
@@ -106,6 +108,10 @@ void Transport::setHandler(Handler h) {
     handler_ = std::move(h);
 }
 
+void Transport::setRawHandler(RawHandler h) {
+    rawHandler_ = std::move(h);
+}
+
 void Transport::start() {
     running_.store(true);
     ioThread_ = std::thread(&Transport::ioLoop, this);
@@ -132,21 +138,25 @@ int Transport::connectTo(const PeerAddress& addr) {
     return fd;
 }
 
-bool Transport::writeFrame(Peer& peer, const std::uint8_t* data,
-                           std::size_t len) {
+bool Transport::writeAll(int fd, const std::uint8_t* data, std::size_t len) {
     std::size_t sent = 0;
     while (sent < len) {
-        const ssize_t n =
-            ::send(peer.fd, data + sent, len - sent, MSG_NOSIGNAL);
+        const ssize_t n = ::send(fd, data + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
-            ::close(peer.fd);
-            peer.fd = -1;
             return false;
         }
         sent += static_cast<std::size_t>(n);
     }
     return true;
+}
+
+bool Transport::writeFrame(Peer& peer, const std::uint8_t* data,
+                           std::size_t len) {
+    if (writeAll(peer.fd, data, len)) return true;
+    ::close(peer.fd);
+    peer.fd = -1;
+    return false;
 }
 
 bool Transport::send(NodeId to, const Message& m) {
@@ -159,12 +169,29 @@ bool Transport::send(NodeId to, const Message& m) {
         return false;
     }
     writeLengthPrefix(static_cast<std::uint32_t>(bodyLen), frame.data());
+    return sendFrame(to, frame.data(), frame.size());
+}
 
+bool Transport::sendFrame(NodeId to, const std::uint8_t* data,
+                          std::size_t len) {
     std::lock_guard lock(peersMu_);
     const auto it = peers_.find(to);
     if (it == peers_.end()) {
-        logf(selfId_, "send dropped", "unknown peer id");
-        return false;
+        // Not a configured peer: try the inbound reply route (clients).
+        // The lock serializes the write against the I/O thread closing the
+        // connection; a failed write just drops the reply — the client
+        // times out and retries, exactly like any lost message.
+        std::lock_guard routeLock(routesMu_);
+        const auto route = inboundRoutes_.find(to);
+        if (route == inboundRoutes_.end()) {
+            logf(selfId_, "send dropped", "unknown peer id and no inbound route");
+            return false;
+        }
+        if (!writeAll(route->second, data, len)) {
+            logf(selfId_, "send dropped", "inbound route write failed");
+            return false;
+        }
+        return true;
     }
     Peer& peer = it->second;
     if (peer.fd < 0) {
@@ -174,11 +201,11 @@ bool Transport::send(NodeId to, const Message& m) {
             return false;
         }
     }
-    if (writeFrame(peer, frame.data(), frame.size())) return true;
+    if (writeFrame(peer, data, len)) return true;
     // The cached connection may have died since the last send (peer restart);
     // retry once on a fresh connection before declaring the peer unreachable.
     peer.fd = connectTo(peer.addr);
-    if (peer.fd >= 0 && writeFrame(peer, frame.data(), frame.size())) {
+    if (peer.fd >= 0 && writeFrame(peer, data, len)) {
         return true;
     }
     logf(selfId_, "send dropped", "peer unreachable (write failed)");
@@ -186,19 +213,32 @@ bool Transport::send(NodeId to, const Message& m) {
 }
 
 void Transport::ioLoop() {
+    // Reported (not asserted) by the Phase 7 allocation test: the rx
+    // thread's decode allocations are the documented residual (DESIGN.md).
+    rsm::metrics::setThreadAllocRole("rx");
     struct Conn {
         int fd;
         FrameAssembler assembler;
     };
     std::vector<Conn> conns;
+    // Rebuilt every iteration but reusing capacity: the pollfd set was the
+    // last per-wakeup allocation on this thread (Phase 7 allocation test).
+    std::vector<pollfd> fds;
 
-    const auto closeConn = [&conns](std::size_t i) {
+    const auto closeConn = [&conns, this](std::size_t i) {
+        // Drop reply routes through this fd and close under the route lock,
+        // so send() can never write to a just-closed (or reused) fd.
+        std::lock_guard lock(routesMu_);
+        for (auto it = inboundRoutes_.begin(); it != inboundRoutes_.end();) {
+            it = it->second == conns[i].fd ? inboundRoutes_.erase(it)
+                                           : std::next(it);
+        }
         ::close(conns[i].fd);
         conns.erase(conns.begin() + static_cast<std::ptrdiff_t>(i));
     };
 
     while (running_.load()) {
-        std::vector<pollfd> fds;
+        fds.clear();
         fds.push_back(pollfd{listenFd_, POLLIN, 0});
         for (const auto& c : conns) fds.push_back(pollfd{c.fd, POLLIN, 0});
 
@@ -229,13 +269,36 @@ void Transport::ioLoop() {
                 continue;
             }
             bool bad = false;
+            const int connFd = conns[i].fd;
             const bool fed = conns[i].assembler.feed(
                 std::span<const std::uint8_t>(buf, static_cast<std::size_t>(n)),
-                [this, &bad](std::span<const std::uint8_t> body) {
+                [this, &bad, connFd](std::span<const std::uint8_t> body) {
+                    if (rawHandler_) {
+                        // Phase 7 path: the consumer decodes into its own
+                        // pooled storage; it reports the sender for the
+                        // reply-route bookkeeping below.
+                        const auto res = rawHandler_(body);
+                        if (!res.ok) {
+                            bad = true;
+                        } else if (res.from != 0) {
+                            // A NEW sender's route node is per-connection
+                            // state (bounded), not per-message churn.
+                            const rsm::metrics::AllocRetention allocTag;
+                            std::lock_guard lock(routesMu_);
+                            inboundRoutes_[res.from] = connFd;
+                        }
+                        return;
+                    }
                     auto decoded = rsm::rpc::decodeMessage(body);
                     if (!decoded) {
                         bad = true;
                         return;
+                    }
+                    {
+                        // Remember which connection speaks for this sender,
+                        // so send() can answer non-peers (clients) on it.
+                        std::lock_guard lock(routesMu_);
+                        inboundRoutes_[decoded->envelope.from] = connFd;
                     }
                     if (handler_) {
                         handler_(decoded->envelope, std::move(decoded->message));
@@ -249,9 +312,26 @@ void Transport::ioLoop() {
 
         if (fds[0].revents & POLLIN) {
             const int fd = ::accept(listenFd_, nullptr, nullptr);
-            if (fd >= 0) conns.push_back(Conn{fd, FrameAssembler{}});
+            if (fd >= 0) {
+                // Replies to clients are written to this accepted fd (the
+                // inbound reply route). TCP_NODELAY matches the outbound
+                // sockets so no path can hit a Nagle/delayed-ACK stall under
+                // a pipelined write pattern. Measured (Phase 7): no delta on
+                // the request-response bench — socket-config consistency,
+                // not a claimed optimization (DESIGN.md).
+                const int one = 1;
+                ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                // Connection state is per-connection (bounded), exempt from
+                // the per-message allocation discipline.
+                const rsm::metrics::AllocRetention allocTag;
+                conns.push_back(Conn{fd, FrameAssembler{}});
+            }
         }
     }
+    // Invalidate reply routes before closing their fds: the event loop may
+    // still call send() during shutdown (transport stops before the loop).
+    std::lock_guard lock(routesMu_);
+    inboundRoutes_.clear();
     for (const auto& c : conns) ::close(c.fd);
 }
 
