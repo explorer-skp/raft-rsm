@@ -61,16 +61,28 @@ inline StoragePair inMemoryStorage(NodeId) {
             std::make_unique<rsm::storage::InMemoryLog>()};
 }
 
+// Per-node state machine, RecordingStateMachine by default. Phase 5 tests
+// pass a factory producing KVStateMachines; the recording-only assertions
+// (applied-sequence comparisons) are skipped for non-recording SMs.
+using SmFactory =
+    std::function<std::unique_ptr<rsm::statemachine::StateMachine>(NodeId)>;
+
+inline std::unique_ptr<rsm::statemachine::StateMachine> recordingSm(NodeId) {
+    return std::make_unique<rsm::statemachine::RecordingStateMachine>();
+}
+
 class SimCluster {
 public:
     explicit SimCluster(const std::vector<NodeSetup>& setups,
                         std::uint64_t deliveryDelaySeed = 0,
                         Duration maxDeliveryDelay = Duration(0),
-                        StorageFactory storage = inMemoryStorage)
+                        StorageFactory storage = inMemoryStorage,
+                        SmFactory smFactory = recordingSm)
         : delayRng_(deliveryDelaySeed),
           maxDelay_(maxDeliveryDelay),
           setups_(setups),
-          storage_(std::move(storage)) {
+          storage_(std::move(storage)),
+          smFactory_(std::move(smFactory)) {
         const auto n = static_cast<NodeId>(setups.size());
         for (NodeId id = 1; id <= n; ++id) {
             nodes_.push_back(std::make_unique<Node>());
@@ -81,7 +93,14 @@ public:
 
     RaftCore& core(NodeId id) { return *nodes_[id - 1]->core; }
     rsm::storage::RaftLog& log(NodeId id) { return *nodes_[id - 1]->log; }
+    // Recording-SM accessor (the default factory); REQUIREs that the node
+    // actually runs a RecordingStateMachine.
     const rsm::statemachine::RecordingStateMachine& sm(NodeId id) const {
+        REQUIRE(nodes_[id - 1]->rec != nullptr);
+        return *nodes_[id - 1]->rec;
+    }
+    // Whatever the factory produced (KV tests downcast this themselves).
+    rsm::statemachine::StateMachine& smAny(NodeId id) {
         return *nodes_[id - 1]->sm;
     }
 
@@ -190,7 +209,10 @@ public:
             if (node->log->entriesFrom(1) != leader->log->entriesFrom(1)) {
                 return false;
             }
-            if (node->sm->applied() != leader->sm->applied()) return false;
+            if (node->rec && leader->rec &&
+                node->rec->applied() != leader->rec->applied()) {
+                return false;
+            }
         }
         return true;
     }
@@ -232,8 +254,9 @@ public:
     void checkStateMachineSafety() const {
         for (std::size_t a = 0; a < nodes_.size(); ++a) {
             for (std::size_t b = a + 1; b < nodes_.size(); ++b) {
-                const auto& sa = nodes_[a]->sm->applied();
-                const auto& sb = nodes_[b]->sm->applied();
+                if (!nodes_[a]->rec || !nodes_[b]->rec) continue;
+                const auto& sa = nodes_[a]->rec->applied();
+                const auto& sb = nodes_[b]->rec->applied();
                 const std::size_t n = std::min(sa.size(), sb.size());
                 for (std::size_t i = 0; i < n; ++i) {
                     REQUIRE(sa[i] == sb[i]);
@@ -255,7 +278,10 @@ private:
     struct Node {
         std::unique_ptr<rsm::raft::PersistentState> persist;
         std::unique_ptr<rsm::storage::RaftLog> log;
-        std::unique_ptr<rsm::statemachine::RecordingStateMachine> sm;
+        std::unique_ptr<rsm::statemachine::StateMachine> sm;
+        // Non-null iff sm is a RecordingStateMachine (the default factory);
+        // gates the applied-sequence assertions below.
+        rsm::statemachine::RecordingStateMachine* rec = nullptr;
         std::unique_ptr<RaftCore> core;
         bool alive = true;
         bool isolated = false;
@@ -279,7 +305,9 @@ private:
         auto storage = storage_(id);
         node.persist = std::move(storage.persist);
         node.log = std::move(storage.log);
-        node.sm = std::make_unique<rsm::statemachine::RecordingStateMachine>();
+        node.sm = smFactory_(id);
+        node.rec = dynamic_cast<rsm::statemachine::RecordingStateMachine*>(
+            node.sm.get());
         node.core = std::make_unique<RaftCore>(
             id, peers, *node.persist, *node.log, *node.sm, clock, seed,
             setups_[id - 1].cfg,
@@ -357,6 +385,7 @@ private:
     Duration maxDelay_;
     std::vector<NodeSetup> setups_;
     StorageFactory storage_;
+    SmFactory smFactory_;
 };
 
 inline std::vector<NodeSetup> defaultSetups(std::uint64_t s1, std::uint64_t s2,

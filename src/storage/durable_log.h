@@ -49,9 +49,11 @@ public:
     DurableLog& operator=(const DurableLog&) = delete;
 
     void append(std::vector<LogEntry> entries) override;
+    void append(std::span<LogEntry> entries) override;
     Term termAt(LogIndex i) const override;
     const LogEntry& entryAt(LogIndex i) const override;
     std::vector<LogEntry> entriesFrom(LogIndex i) const override;
+    std::span<const LogEntry> entriesSpan(LogIndex i) const override;
     void truncateSuffixFrom(LogIndex i) override;
     LogIndex lastIndex() const override { return entries_.size(); }
     Term lastTerm() const override {
@@ -72,6 +74,7 @@ private:
     int fd_ = -1;
     std::vector<LogEntry> entries_;       // entries_[i-1] holds index i
     std::vector<std::uint64_t> offsets_;  // offsets_[i-1]: record i's offset
+    std::vector<std::uint8_t> writeBuf_;  // append() serialization, reused
     std::uint64_t size_ = 0;              // file end == next record's offset
     std::uint64_t tornBytesDiscarded_ = 0;
 };

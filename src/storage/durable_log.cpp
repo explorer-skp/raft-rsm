@@ -1,5 +1,7 @@
 #include "storage/durable_log.h"
 
+#include "metrics/alloc_gate.h"
+
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -127,12 +129,20 @@ void DurableLog::replay() {
 }
 
 void DurableLog::append(std::vector<LogEntry> entries) {
+    append(std::span<LogEntry>(entries));
+}
+
+void DurableLog::append(std::span<LogEntry> entries) {
     if (entries.empty()) return;
+    // Everything allocated here is the log's retained state (the in-memory
+    // entry copy and its index) or the reusable serialization buffer — the
+    // Phase 7 allocation test exempts it as data-proportional.
+    const rsm::metrics::AllocRetention allocTag;
 
     std::size_t total = 0;
     for (const auto& e : entries) total += recordSize(e);
-    std::vector<std::uint8_t> buf(total);
-    rsm::rpc::Writer w(buf);
+    writeBuf_.resize(total);  // capacity reused across appends
+    rsm::rpc::Writer w(writeBuf_);
     LogIndex index = lastIndex();
     for (const auto& e : entries) {
         const std::size_t recOff = w.written();
@@ -140,13 +150,15 @@ void DurableLog::append(std::vector<LogEntry> entries) {
         w.u64(e.term);
         w.u32(static_cast<std::uint32_t>(e.command.size()));
         w.bytes(e.command.data(), e.command.size());
-        w.u32(crc32c(buf.data() + recOff, kHeaderSize + e.command.size()));
+        w.u32(crc32c(writeBuf_.data() + recOff,
+                     kHeaderSize + e.command.size()));
     }
     assert(w.ok() && w.written() == total);
 
-    detail::pwriteAll(fd_, buf.data(), total, size_, path_);
-    // Both policies fsync here until Phase 7 adds the batched group-commit
-    // path; see FsyncPolicy. The entries are durable when append() returns.
+    detail::pwriteAll(fd_, writeBuf_.data(), total, size_, path_);
+    // One fsync per append CALL: a multi-entry append (the Phase 7 batched
+    // group commit) is one durability point. The entries are durable when
+    // append() returns, under either FsyncPolicy.
     detail::fsyncFd(fd_, path_);
 
     std::uint64_t off = size_;
@@ -156,6 +168,12 @@ void DurableLog::append(std::vector<LogEntry> entries) {
         entries_.push_back(std::move(e));
     }
     size_ = off;
+}
+
+std::span<const LogEntry> DurableLog::entriesSpan(LogIndex i) const {
+    if (i < 1) i = 1;
+    if (i > lastIndex()) return {};
+    return {entries_.data() + (i - 1), entries_.size() - (i - 1)};
 }
 
 Term DurableLog::termAt(LogIndex i) const {

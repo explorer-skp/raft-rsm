@@ -101,28 +101,6 @@ bool decodePayload(Reader& r, RequestVoteReply& m) {
     return r.ok() && decodeBool(r, m.voteGranted);
 }
 
-bool decodePayload(Reader& r, AppendEntries& m) {
-    m.term = r.u64();
-    m.leaderId = r.u16();
-    m.prevLogIndex = r.u64();
-    m.prevLogTerm = r.u64();
-    m.leaderCommit = r.u64();
-    const std::uint32_t count = r.u32();
-    if (!r.ok()) return false;
-    // Each entry occupies >= kMinEntryWireSize bytes, so a count the input
-    // cannot back is rejected before any allocation sized by it.
-    if (count > r.remaining() / kMinEntryWireSize) return false;
-    m.entries.clear();
-    m.entries.reserve(count);
-    for (std::uint32_t i = 0; i < count; ++i) {
-        LogEntry e;
-        e.term = r.u64();
-        if (!r.ok() || !decodeBlob(r, e.command)) return false;
-        m.entries.push_back(std::move(e));
-    }
-    return true;
-}
-
 bool decodePayload(Reader& r, AppendEntriesReply& m) {
     m.term = r.u64();
     if (!r.ok() || !decodeBool(r, m.success)) return false;
@@ -147,12 +125,80 @@ bool decodePayload(Reader& r, ClientReply& m) {
     return decodeBlob(r, m.result);
 }
 
-template <typename T>
-bool decodeInto(Reader& r, Message& out) {
-    T m;
-    if (!decodePayload(r, m)) return false;
-    out = std::move(m);
+// The AppendEntries decoder is in-place by construction (Phase 7 rx path):
+// existing entries are overwritten via assign (capacity reuse); growth
+// pulls command buffers from the pool, shrink salvages them back. The
+// count check still rejects input-unbackable counts BEFORE any growth.
+bool decodePayloadInto(Reader& r, AppendEntries& m, DecodePool& pool) {
+    m.term = r.u64();
+    m.leaderId = r.u16();
+    m.prevLogIndex = r.u64();
+    m.prevLogTerm = r.u64();
+    m.leaderCommit = r.u64();
+    const std::uint32_t count = r.u32();
+    if (!r.ok()) return false;
+    if (count > r.remaining() / kMinEntryWireSize) return false;
+    while (m.entries.size() > count) {
+        pool.putBuf(std::move(m.entries.back().command));
+        m.entries.pop_back();
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (i == m.entries.size()) {
+            LogEntry e;
+            e.command = pool.getBuf();
+            m.entries.push_back(std::move(e));
+        }
+        LogEntry& e = m.entries[i];
+        e.term = r.u64();
+        if (!r.ok() || !decodeBlob(r, e.command)) return false;
+    }
     return true;
+}
+
+// Moves an alternative's heap buffers into the pool before the variant
+// switches away from it, so they are recycled instead of freed.
+void salvage(Message& m, DecodePool& pool) {
+    if (auto* ae = std::get_if<AppendEntries>(&m)) {
+        for (auto& e : ae->entries) pool.putBuf(std::move(e.command));
+        ae->entries.clear();
+        pool.entryLists.push_back(std::move(ae->entries));
+    } else if (auto* cr = std::get_if<ClientRequest>(&m)) {
+        pool.putBuf(std::move(cr->command));
+    } else if (auto* rep = std::get_if<ClientReply>(&m)) {
+        pool.putBuf(std::move(rep->result));
+    }
+}
+
+// Ensures `msg` holds alternative T, recycling buffers across the switch.
+template <typename T>
+T& alternativeFor(Message& msg, DecodePool& pool) {
+    if (auto* p = std::get_if<T>(&msg)) return *p;
+    salvage(msg, pool);
+    T& fresh = msg.emplace<T>();
+    if constexpr (std::is_same_v<T, AppendEntries>) {
+        if (!pool.entryLists.empty()) {
+            fresh.entries = std::move(pool.entryLists.back());
+            pool.entryLists.pop_back();
+        }
+    } else if constexpr (std::is_same_v<T, ClientRequest>) {
+        fresh.command = pool.getBuf();
+    } else if constexpr (std::is_same_v<T, ClientReply>) {
+        fresh.result = pool.getBuf();
+    }
+    return fresh;
+}
+
+template <typename T>
+bool decodeIntoAlternative(Reader& r, Message& out, DecodePool& pool) {
+    T& m = alternativeFor<T>(out, pool);
+    if constexpr (std::is_same_v<T, AppendEntries>) {
+        return decodePayloadInto(r, m, pool);
+    } else {
+        // The non-AE decoders already assign into existing vectors
+        // (decodeBlob -> Reader::readBytes -> assign), so in-place reuse
+        // needs no separate code path.
+        return decodePayload(r, m);
+    }
 }
 
 }  // namespace
@@ -219,13 +265,13 @@ std::size_t encodeMessage(NodeId from, NodeId to, const Message& m,
     return w.ok() ? w.written() : 0;
 }
 
-std::optional<DecodedMessage> decodeMessage(std::span<const std::uint8_t> frame) {
+bool decodeMessageInto(std::span<const std::uint8_t> frame,
+                       DecodedMessage& out, DecodePool& pool) {
     if (frame.size() < kEnvelopeSize ||
         frame.size() > kEnvelopeSize + kMaxPayloadSize) {
-        return std::nullopt;
+        return false;
     }
     Reader r(frame);
-    DecodedMessage out;
     Envelope& env = out.envelope;
     env.version = r.u8();
     const std::uint8_t rawType = r.u8();
@@ -236,32 +282,40 @@ std::optional<DecodedMessage> decodeMessage(std::span<const std::uint8_t> frame)
     if (!r.ok() || env.version != kProtocolVersion || reserved != 0 ||
         !validType(rawType) ||
         env.payloadLength != frame.size() - kEnvelopeSize) {
-        return std::nullopt;
+        return false;
     }
     env.type = static_cast<MessageType>(rawType);
 
     bool good = false;
     switch (env.type) {
         case MessageType::RequestVote:
-            good = decodeInto<RequestVote>(r, out.message);
+            good = decodeIntoAlternative<RequestVote>(r, out.message, pool);
             break;
         case MessageType::RequestVoteReply:
-            good = decodeInto<RequestVoteReply>(r, out.message);
+            good = decodeIntoAlternative<RequestVoteReply>(r, out.message,
+                                                           pool);
             break;
         case MessageType::AppendEntries:
-            good = decodeInto<AppendEntries>(r, out.message);
+            good = decodeIntoAlternative<AppendEntries>(r, out.message, pool);
             break;
         case MessageType::AppendEntriesReply:
-            good = decodeInto<AppendEntriesReply>(r, out.message);
+            good = decodeIntoAlternative<AppendEntriesReply>(r, out.message,
+                                                             pool);
             break;
         case MessageType::ClientRequest:
-            good = decodeInto<ClientRequest>(r, out.message);
+            good = decodeIntoAlternative<ClientRequest>(r, out.message, pool);
             break;
         case MessageType::ClientReply:
-            good = decodeInto<ClientReply>(r, out.message);
+            good = decodeIntoAlternative<ClientReply>(r, out.message, pool);
             break;
     }
-    if (!good || !r.exhausted()) return std::nullopt;
+    return good && r.exhausted();
+}
+
+std::optional<DecodedMessage> decodeMessage(std::span<const std::uint8_t> frame) {
+    DecodedMessage out;
+    DecodePool pool;
+    if (!decodeMessageInto(frame, out, pool)) return std::nullopt;
     return out;
 }
 

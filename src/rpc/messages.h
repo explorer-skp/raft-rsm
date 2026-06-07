@@ -123,10 +123,38 @@ struct DecodedMessage {
     Message message;
 };
 
+// Recycled buffers for allocation-free decoding (Phase 7): byte buffers and
+// entry lists keep their capacity as they move between the pool and the
+// message alternatives a DecodedMessage cycles through.
+struct DecodePool {
+    std::vector<std::vector<std::uint8_t>> bufs;
+    std::vector<std::vector<LogEntry>> entryLists;
+
+    std::vector<std::uint8_t> getBuf() {
+        if (bufs.empty()) return {};
+        auto b = std::move(bufs.back());
+        bufs.pop_back();
+        return b;
+    }
+    void putBuf(std::vector<std::uint8_t>&& b) { bufs.push_back(std::move(b)); }
+};
+
 // Decodes one full frame body (envelope + payload). Strict: rejects unknown
 // version/type, nonzero reserved bytes, payloadLength that disagrees with the
 // buffer size, truncated payloads, and trailing bytes. Never over-reads and
 // never allocates more than the input can justify.
 std::optional<DecodedMessage> decodeMessage(std::span<const std::uint8_t> frame);
+
+// Identical validation to decodeMessage, but decodes INTO `out`, reusing its
+// buffers: when out.message already holds this frame's alternative, vectors
+// are assigned in place (capacity reuse); on an alternative switch the old
+// alternative's buffers are salvaged into `pool` and the new one is dressed
+// from it. With a long-lived (out, pool) pair — e.g. an inbound-ring slot —
+// steady-state decoding performs zero heap allocations once warm (the
+// Phase 7 rx path; asserted by the allocation test). On false, `out` holds
+// unspecified but destructible scratch; the caller must treat the frame as
+// a protocol error exactly as for decodeMessage's nullopt.
+bool decodeMessageInto(std::span<const std::uint8_t> frame,
+                       DecodedMessage& out, DecodePool& pool);
 
 }  // namespace rsm::rpc

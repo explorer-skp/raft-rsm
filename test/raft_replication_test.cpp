@@ -374,3 +374,53 @@ TEST_CASE("propose: leader assigns sequential indices at its term; "
     }
     CHECK(sawAeTo2);
 }
+
+TEST_CASE("ack handling: a duplicate / non-advancing success ack never "
+          "re-sends AppendEntries (AE<->ack storm regression, Phase 7)") {
+    // The Phase 7 perf bug: resending on EVERY success ack while any entry
+    // was unacked let duplicate acks (from pipelined propose-time AEs)
+    // spawn redundant AEs, each spawning another ack — a self-sustaining
+    // storm (measured >170k msgs/s for ~400 client ops/s). The rule this
+    // test pins: a follow-up AE is sent ONLY when the ack ADVANCED
+    // matchIndex and entries remain; retransmission of lost AEs belongs to
+    // the heartbeat timer alone.
+    Harness h;
+    h.winElection();
+    h.core.propose({0xA1});
+    h.core.propose({0xA2});
+
+    const auto aeCountTo = [&](NodeId to) {
+        std::size_t n = 0;
+        for (const auto& [peer, m] : h.sent) {
+            if (peer == to && std::holds_alternative<AppendEntries>(m)) ++n;
+        }
+        return n;
+    };
+
+    // An ADVANCING partial ack (index 1 of 2) continues the catch-up.
+    const auto before = aeCountTo(2);
+    h.deliver(2, Message{AppendEntriesReply{h.core.term(), true,
+                                            /*ack=*/1, 0}});
+    CHECK(aeCountTo(2) == before + 1);  // follow-up carries the remainder
+
+    // The SAME ack again (duplicate; matchIndex unchanged): no AE, even
+    // though index 2 is still unacked.
+    h.deliver(2, Message{AppendEntriesReply{h.core.term(), true, 1, 0}});
+    CHECK(aeCountTo(2) == before + 1);
+
+    // A stale lower ack: also no AE.
+    h.deliver(2, Message{AppendEntriesReply{h.core.term(), true, 0, 0}});
+    CHECK(aeCountTo(2) == before + 1);
+
+    // Liveness is the heartbeat's job: the timer retransmits the suffix.
+    h.clock.advance(Duration(50));
+    h.core.tick();
+    CHECK(aeCountTo(2) == before + 2);
+    CHECK(h.lastAppendTo(2).prevLogIndex == 1);  // resends from matchIndex+1
+
+    // Once the ack advances past the end, silence even after more acks.
+    h.deliver(2, Message{AppendEntriesReply{h.core.term(), true, 2, 0}});
+    const auto afterFinal = aeCountTo(2);
+    h.deliver(2, Message{AppendEntriesReply{h.core.term(), true, 2, 0}});
+    CHECK(aeCountTo(2) == afterFinal);
+}

@@ -1,7 +1,8 @@
 // Node entrypoint: brings up the transport from a peer config and runs the
-// Raft event loop over durable storage (Phase 4): currentTerm/votedFor and
-// the log live in --data-dir and survive restart; recovery (replay, torn
-// tail repair) happens during construction, before the node says a word.
+// Phase 7 threaded runtime (network rx -> Raft -> {tx, apply} over lock-free
+// rings) over durable storage (Phase 4): currentTerm/votedFor and the log
+// live in --data-dir and survive restart; recovery (replay, torn tail
+// repair) happens during construction, before the node says a word.
 
 #include <atomic>
 #include <chrono>
@@ -15,10 +16,13 @@
 #include <thread>
 #include <vector>
 
+#include <memory>
+
+#include "client/client_service.h"
 #include "raft/clock.h"
-#include "raft/event_loop.h"
 #include "raft/raft_core.h"
-#include "statemachine/state_machine.h"
+#include "runtime/node_runtime.h"
+#include "statemachine/kv_store.h"
 #include "storage/durable_log.h"
 #include "storage/durable_state.h"
 #include "transport/transport.h"
@@ -34,7 +38,8 @@ void handleSignal(int) {
 int usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --id N --config <file> --data-dir <dir> "
-                 "[--fsync every|group]\n",
+                 "[--fsync every|group] [--wait block|spin] [--batch N] "
+                 "[--linger-us N]\n",
                  argv0);
     return 2;
 }
@@ -46,6 +51,9 @@ int main(int argc, char** argv) {
     std::string configPath;
     std::string dataDir;
     auto fsyncPolicy = rsm::storage::FsyncPolicy::EveryDurabilityPoint;
+    auto waitMode = rsm::runtime::WaitMode::Block;
+    long batch = 1;
+    long lingerUs = 200;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--id") == 0 && i + 1 < argc) {
             id = std::strtol(argv[++i], nullptr, 10);
@@ -62,11 +70,25 @@ int main(int argc, char** argv) {
             } else {
                 return usage(argv[0]);
             }
+        } else if (std::strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            batch = std::strtol(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--linger-us") == 0 && i + 1 < argc) {
+            lingerUs = std::strtol(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v == "block") {
+                waitMode = rsm::runtime::WaitMode::Block;
+            } else if (v == "spin") {
+                waitMode = rsm::runtime::WaitMode::Spin;
+            } else {
+                return usage(argv[0]);
+            }
         } else {
             return usage(argv[0]);
         }
     }
-    if (id < 0 || id > 0xFFFF || configPath.empty() || dataDir.empty()) {
+    if (id < 0 || id > 0xFFFF || configPath.empty() || dataDir.empty() ||
+        batch < 1 || lingerUs < 0) {
         return usage(argv[0]);
     }
     const auto selfId = static_cast<rsm::rpc::NodeId>(id);
@@ -101,21 +123,54 @@ int main(int argc, char** argv) {
                 : "none",
             static_cast<unsigned long long>(log.lastIndex()),
             static_cast<unsigned long long>(log.tornBytesDiscarded()));
-        rsm::statemachine::RecordingStateMachine sm;
+        rsm::statemachine::KVStateMachine sm;
         const std::uint64_t seed = std::random_device{}();
-        rsm::raft::RaftCore core(
-            selfId, peerIds, persist, log, sm, clock, seed,
-            rsm::raft::RaftConfig{},
-            [&transport](rsm::rpc::NodeId to, const rsm::rpc::Message& m) {
-                transport.send(to, m);  // drop-on-failure; Raft retries by timer
+        // The runtime is constructed after the core (it needs the core
+        // reference), so the core's send hook indirects through this
+        // pointer; no message can be sent before runtime->start() anyway.
+        std::unique_ptr<rsm::runtime::NodeRuntime> runtime;
+        const auto pipelineSend = [&runtime, &transport](
+                                      rsm::rpc::NodeId to,
+                                      const rsm::rpc::Message& m) {
+            // Encode on the calling pipeline thread, socket write on the tx
+            // thread; drop-on-failure as before (Raft retries by timer,
+            // clients retry by timeout).
+            if (runtime) runtime->sendFromPipeline(to, m);
+            else transport.send(to, m);
+        };
+        rsm::raft::RaftCore core(selfId, peerIds, persist, log, sm, clock,
+                                 seed, rsm::raft::RaftConfig{}, pipelineSend);
+        rsm::client::ClientService clientService(core, pipelineSend);
+        if (batch > 1) {
+            clientService.setBatching(rsm::client::ClientService::Batching{
+                static_cast<std::size_t>(batch),
+                std::chrono::microseconds(lingerUs)});
+        }
+        core.setClientRequestHandler(
+            [&clientService](rsm::rpc::NodeId from,
+                             const rsm::rpc::ClientRequest& req) {
+                clientService.onClientRequest(from, req);
             });
-        rsm::raft::RaftEventLoop loop(core);
+        rsm::runtime::NodeRuntimeConfig runtimeCfg;
+        runtimeCfg.waitMode = waitMode;
+        runtime = std::make_unique<rsm::runtime::NodeRuntime>(
+            core, transport, sm,
+            [&clientService](rsm::rpc::LogIndex index,
+                             const rsm::rpc::LogEntry& entry,
+                             const std::string& result) {
+                clientService.onApplied(index, entry, result);
+            },
+            runtimeCfg);
+        runtime->setServiceHook(
+            [&clientService](rsm::raft::TimePoint now) {
+                return clientService.flushIfDue(now);
+            });
 
-        transport.setHandler([&loop](const rsm::rpc::Envelope& env,
-                                     rsm::rpc::Message&& m) {
-            loop.enqueue(env, std::move(m));
-        });
-        loop.start();
+        transport.setRawHandler(
+            [&runtime](std::span<const std::uint8_t> body) {
+                return runtime->enqueueFrame(body);
+            });
+        runtime->start();
         transport.start();
         std::printf("node %u listening on 127.0.0.1:%u (raft seed %llu)\n",
                     selfId, transport.listenPort(),
@@ -128,7 +183,7 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         transport.stop();
-        loop.stop();
+        runtime->stop();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());
         return 1;

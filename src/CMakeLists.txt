@@ -1,5 +1,8 @@
 add_subdirectory(rpc)
+add_subdirectory(metrics)
 add_subdirectory(transport)
 add_subdirectory(storage)
+add_subdirectory(statemachine)
 add_subdirectory(raft)
+add_subdirectory(client)
 add_subdirectory(runtime)

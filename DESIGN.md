@@ -7,11 +7,11 @@ and how each safety invariant is tested. Authoritative spec: `../raft_rsm_build_
 
 | # | Invariant | Test (filled in as phases land) |
 |---|-----------|--------------------------------|
-| 1 | Election Safety — at most one leader per term | Asserted over the **whole history** of every Phase 2 integration run: a transition observer records each `won-election` as (term → node); the assertion is that no term maps to two nodes. Checked after every simulated millisecond in `raft_sim_test.cpp` (cold start, leader failure, split vote, 20-seed chaotic timing, partition/rejoin) and across the real-TCP run in `raft_cluster_test.cpp`. |
-| 2 | Leader Append-Only — a leader never overwrites/deletes its own log entries | Enforced by construction: `truncateSuffixFrom` has exactly one call site, inside the AppendEntries *receiver* after the leader role is excluded (a leader ignores a valid AE at its own term and steps down to follower before processing a higher-term one), and `propose()` only appends. Exercised by every Phase 3 leadership-change test. |
-| 3 | Log Matching — same index+term ⇒ identical logs up to that point | `SimCluster::checkLogMatching()`: for every pair of live logs, at every index where both hold the same term the full prefixes are compared entry-by-entry. Run at the end of every Phase 3 sim test (normal replication, catch-up, divergent repair, duplicate-AE, Figure 8). |
-| 4 | Leader Completeness — a committed entry is present in all future leaders' logs | Exercised by the Figure 8 sim test and the real-TCP failover test (new leader holds and re-commits every committed entry), and since Phase 4 across **crashes**: committed entries survive follower/leader crash+restart and full-cluster restart (durable sim + real-TCP restart tests), resting on the durable-commit invariant below. *(Seeded chaos schedule lands in Phase 6.)* |
-| 5 | State Machine Safety — no two nodes apply different commands at the same log index | `SimCluster::checkStateMachineSafety()`: pairwise position-by-position comparison of the recorded applied sequences, run in every Phase 3 sim test; the real-TCP test asserts byte-identical applied sequences across nodes and across a failover. *(Chaos-schedule coverage lands with the Phase 6 harness.)* |
+| 1 | Election Safety — at most one leader per term | Asserted over the **whole history** of every Phase 2 integration run: a transition observer records each `won-election` as (term → node); the assertion is that no term maps to two nodes. Checked after every simulated millisecond in `raft_sim_test.cpp` (cold start, leader failure, split vote, 20-seed chaotic timing, partition/rejoin) and across the real-TCP run in `raft_cluster_test.cpp`. Since Phase 6: `ElectionSafetyChecker` monitors every election win continuously through every seeded chaos run; self-tested against a fabricated double-leader sighting. |
+| 2 | Leader Append-Only — a leader never overwrites/deletes its own log entries | Enforced by construction: `truncateSuffixFrom` has exactly one call site, inside the AppendEntries *receiver* after the leader role is excluded (a leader ignores a valid AE at its own term and steps down to follower before processing a higher-term one), and `propose()` only appends. Exercised by every Phase 3 leadership-change test. Since Phase 6: `LeaderAppendOnlyChecker` fingerprints every leader's log every simulated millisecond of every chaos run and flags any shrink or in-place change during one leadership; self-tested against fabricated shrink/overwrite. |
+| 3 | Log Matching — same index+term ⇒ identical logs up to that point | `SimCluster::checkLogMatching()`: for every pair of live logs, at every index where both hold the same term the full prefixes are compared entry-by-entry. Run at the end of every Phase 3 sim test (normal replication, catch-up, divergent repair, duplicate-AE, Figure 8). Since Phase 6: `checkLogMatching()` sweeps all live logs every 25 simulated ms and at quiescence of every chaos run; self-tested against fabricated same-term divergence. |
+| 4 | Leader Completeness — a committed entry is present in all future leaders' logs | Exercised by the Figure 8 sim test and the real-TCP failover test (new leader holds and re-commits every committed entry), and since Phase 4 across **crashes**: committed entries survive follower/leader crash+restart and full-cluster restart (durable sim + real-TCP restart tests), resting on the durable-commit invariant below. Since Phase 6: `CommitChecker` keeps the global record of every entry ever observed committed and asserts, at **every election win** in every chaos run, that the new leader holds the entire record; the deterministic five-node Figure 8 scenario closes the Phase 3 deferral (both branches). Self-tested against a fabricated short/divergent winner. |
+| 5 | State Machine Safety — no two nodes apply different commands at the same log index | `SimCluster::checkStateMachineSafety()`: pairwise position-by-position comparison of the recorded applied sequences, run in every Phase 3 sim test; the real-TCP test asserts byte-identical applied sequences across nodes and across a failover. Since Phase 6: `AppliedConsistencyChecker` checks **every apply on every node** in every chaos run against the global index → (entry, result) record — including re-applies after crash recovery, and including the apply *result* (replica determinism); self-tested against fabricated divergent commands and divergent results. |
 
 ## Decisions
 
@@ -380,9 +380,476 @@ deployments append a no-op entry on election win; parked until the client
 phases need it. After a **single-node** restart this is invisible — the
 surviving leader's `commitIndex` propagates via heartbeats immediately.
 
+## Client sessions, exactly-once dedup, and the KV store (Phase 5)
+
+### Decision points (phase prompt §"Decision points")
+
+1. **Reads go through the log.** Every `GET` is a replicated command,
+   committed and applied like a write, so it is linearizable by the same
+   argument as writes (it reads at its log position). ReadIndex/leases are
+   deferred to the performance phases with a measured justification.
+2. **`clientId` is client-supplied** (u64; the wire field existed since
+   Phase 1). No `RegisterClient` command: at this scale a random u64 per
+   client makes collisions negligible, tests use fixed ids, and one fewer
+   special log-entry type keeps apply uniform. Revisit if real id allocation
+   is ever needed.
+3. **No session eviction.** The session table grows with distinct clients —
+   bounded by test scale. CONSTRAINT for whoever adds eviction later: it
+   must be deterministic and driven by replicated applied state (e.g.
+   logical progress), NEVER a local wall-clock timer — a local timer
+   diverges replicas and breaks State Machine Safety.
+4. **No leader duplicate short-circuit.** A duplicate retry is appended like
+   any command; apply-time dedup turns it into a cached-result no-op. Log
+   bloat per retry is acceptable at this scale, and there is exactly one
+   code path that answers clients.
+
+### Dedup design (the correctness core)
+
+- Identity is `(clientId, seqNo)`, seqNo monotonic per client starting at 1;
+  a retry NEVER gets a new seqNo (KvClient guarantees this; `resendLast()`
+  is the test hook for "the ack was lost").
+- The session table `clientId -> {lastSeq, lastResult}` lives INSIDE
+  `KVStateMachine`, i.e. in replicated applied state, and dedup happens
+  inside `apply()`, deterministically, on every replica: `seqNo <= lastSeq`
+  → return cached result, no side effect; else apply, record, return.
+- Why apply-time and replicated: a client retries the same request across a
+  leader failover. The new leader's applied state already contains the
+  session entry, so re-proposing the retry commits a duplicate entry whose
+  apply is a no-op returning the cached result. Leader-side receive-time
+  dedup would re-apply the side effect on the new leader. Verified with the
+  non-idempotent APPEND op in sim and over TCP.
+- Only the LATEST result per client is cached ⇒ one outstanding request per
+  client (the standard Raft session assumption; KvClient is synchronous).
+  An older seqNo still returns the latest cached result, never re-applies.
+- `clientId 0` opts out of sessions (internal/test commands, no dedup).
+- The session table is part of `serialize()`/`deserialize()` alongside the
+  KV map, so a Phase 8 snapshot cannot lose dedup state (unit-tested:
+  dedup still suppresses a replayed duplicate after a round-trip).
+
+### KV state machine
+
+Ops `PUT/GET/DELETE/CAS` plus **`APPEND`** (value += arg), added
+deliberately as the non-idempotent probe the exactly-once tests need.
+Deterministic by construction: `std::map`, no clock, no RNG. CAS treats an
+absent key as `""` (create-if-absent in one primitive); empty-string values
+are real values, distinct from absent, for PUT/GET/DELETE. Command bytes
+(replicated verbatim, LE): `[u64 clientId][u64 seqNo][u8 op]
+[u32 keyLen, key]([u32 argLen, arg]([u32 arg2Len, arg2] CAS only))`.
+Result string: status byte `'O'/'N'/'F'/'E'` (ok / not-found / cas-failed /
+malformed) + optional payload (GET value; APPEND new value). Malformed
+commands return `'E'` with no side effect and are never cached.
+
+### Client request path (server side)
+
+Two new RaftCore seams, both invoked on the event-loop thread and both
+logic-free for Raft: `setClientRequestHandler` (routes ClientRequest out of
+`handle()`) and `setApplyObserver` (index, entry, result after each apply).
+`ClientService` sits on them: non-leader → `NOT_LEADER` + believed leader
+hint; leader → validate that the command's embedded 16-byte identity prefix
+equals the wire `(clientId, seqNo)` (reject with `Error` otherwise — the SM
+dedups on the embedded copy, reply correlation uses the wire copy, they must
+agree), `propose()` verbatim, and record `index -> (client, identity)` in a
+pending table. On apply at that index: identity matches → `OK` + the
+apply() result; mismatch (our entry was truncated and another leader's
+committed there) → `NOT_LEADER`, the client retries safely. Pending entries
+are not flushed on step-down — they resolve via the identity check or the
+client's timeout (tested: the overwritten-pending case answers NOT_LEADER,
+never a wrong OK).
+
+### Client library and routing protocol
+
+`KvClient` (synchronous, raw TCP per attempt): send to the believed leader
+(else round-robin), await the reply on the same connection with a
+per-attempt timeout; on `NOT_LEADER` with a hint follow it immediately; on
+timeout/connect-failure/hint-less `NOT_LEADER` forget the preference and
+rotate after a 25 ms backoff, up to a bounded attempt budget. Retries reuse
+the same `(clientId, seqNo)`. A result is surfaced only from an `OK` reply,
+which the leader sends only after commit+apply.
+
+### Transport: inbound reply routing
+
+Clients are not in the peer table, so `send(to)` falls back to the inbound
+connection that most recently delivered a message with envelope
+`from == to` (map maintained by the I/O thread; the route mutex serializes
+reply writes against connection close, and a failed/raced write just drops
+the reply — the client times out and retries like any lost message).
+Convention this rests on: client envelope ids are unique and disjoint from
+cluster node ids (cluster ids are small; tests use 99/200/201, kv_cli
+defaults to 100). The two-simplex-connections model for peers is unchanged.
+
+## Deterministic simulation, fault injection, and chaos (Phase 6)
+
+### The sim/real seam
+
+`RaftCore` never knew about TCP: it emits through a `SendFn` callback,
+receives through `handle()`, takes time from the injected `Clock`, and
+randomness from its seeded PRNG. Those four seams (in place since Phases
+1–2) are the entire sim/real boundary. In sim mode (`faults/`):
+
+- `SimNetwork` replaces TCP: an in-memory bus; each node's `SendFn` (and
+  its `ClientService`'s) posts onto it.
+- The shared `ManualClock` replaces `SteadyClock`.
+- `SimHarness::stepMs()` replaces `RaftEventLoop` (which needs a real
+  clock and a thread): it advances virtual time 1 ms, ticks every live
+  node in node-id order, then drains every due message — including
+  same-step cascades — in the bus's deterministic order. **No OS threads
+  exist in a sim run.**
+
+Everything else — `raft_core.cpp`, `DurableLog`/`DurablePersistentState`
+(chaos runs use the real Phase 4 files in a temp dir, so every crash
+exercises real replay), `KVStateMachine` with its session table, and
+`ClientService` — is byte-for-byte the production code. The earlier, more
+limited `test/sim_cluster.h` harness is kept as-is for the Phase 2–5 tests;
+the `faults/` harness is the Phase 6+ chaos instrument.
+
+### Fault model (`faults/`, the /faults control surface)
+
+Network — all decided at send time by one seeded RNG: **drop** probability,
+**latency** uniform in [min, max] per message, **reorder** (probability of
+up to `extraMax` additional delay, letting later messages overtake), and
+**partition** into arbitrary groups (a cluster node in no group is fully
+isolated; a partition also kills in-flight cross-group messages at
+delivery — "isolate now" means now). Client traffic shares drop/latency/
+reorder but bypasses partitions (clients may dial any node, like the real
+`KvClient`). Node — **crash** (instant stop; messages already on the wire
+keep flying — packets don't vanish when their sender dies; durable state
+survives via the storage factory, volatile state is rebuilt from a fresh
+`RaftCore`), **restart**, **leader kill** (crash the highest-term live
+leader), and **graceful stop**, implemented as crash and documented as
+observably identical here: every durability point is synchronous
+(fsync-before-ack), so a clean shutdown has nothing to flush; torn-write
+recovery is covered by the Phase 4 storage tests.
+
+### Determinism rules (load-bearing)
+
+- One RNG per concern (network, fault schedule, exec-time target picks,
+  per-client workload, per-node election timers), all derived from the
+  master seed via splitmix64.
+- Every `send()` draws the same number of RNG words regardless of current
+  fault settings, so toggling faults never desynchronizes the stream.
+- Fault decisions use raw modulo/threshold on `mt19937_64` output —
+  `std::uniform_*_distribution` is implementation-defined, so it is kept
+  out of the sim path (reproducibility is guaranteed per binary either
+  way; this just removes one source of variation, and modulo bias is
+  irrelevant for chaos). `RaftCore`'s internal timeout draw still uses
+  `uniform_int_distribution` — unchanged production code, deterministic
+  for a seed on a given build.
+- Delivery order is a strict weak order on (deliverAt, enqueueSeq); maps
+  (never unordered containers) everywhere on the sim path; no wall clock.
+- Restart RNG seeds derive from (master seed, node, incarnation number).
+- Determinism is a **tested property**: the determinism test runs the same
+  seed twice and asserts the full run traces (every delivery, fault,
+  transition, apply, client invoke/ack — temp-dir paths excluded by
+  construction) are identical line for line.
+
+### Sim clients and reply correlation
+
+The real `KvClient` is synchronous over per-attempt TCP connections and
+cannot run inside the single-threaded simulator, so `SimClient` replicates
+its **protocol** as a virtual-time state machine: route to believed leader
+(else seeded rotation), follow NOT_LEADER hints, 25 ms backoff, 400 ms
+attempt timeout, and a retry NEVER changes `(clientId, seqNo)`. Reply
+correlation mirrors connection-per-attempt: each attempt uses a fresh
+envelope id from the client's id range, and only a reply addressed to the
+current attempt's id from the current target counts — a delayed OK from an
+old attempt can never be credited to a newer operation (chaos found this
+ambiguity immediately; real TCP never had it because replies arrive on the
+connection that asked).
+
+### Workload distribution (decision)
+
+4 clients × ≤12 ops over a 4-key space ("k0".."k3" — deliberately tiny for
+contention), mix PUT 30 / GET 25 / APPEND 20 / CAS 15 / DELETE 10, seeded
+think time 200–1200 ms between ops so the workload **spans the fault
+window** (the first cut of the suite finished all ops before the first
+fault landed and proved nothing — visible because committed entries ≈
+acked ops, i.e. no retry duplicates were being deduped). Every written
+value encodes (client, seq) so all writes are distinguishable to the
+checker. Each client holds one final marker PUT until 1.5 s after
+heal-everything: it witnesses post-heal liveness and forces a current-term
+commit, which is also what re-propagates `commitIndex` after a
+full-cluster restart (the Phase 4 nuance).
+
+### Checkers (reusable, self-validated — `faults/checkers.h`)
+
+All checkers consume plain data (terms, node ids, log images = per-index
+(term, FNV-1a fingerprint)), accumulate violation strings, and never
+abort — so self-tests can feed fabricated violations and assert they are
+FLAGGED. A checker that cannot fail proves nothing; every checker has a
+must-flag self-test. Election Safety: every win, whole run. Leader
+Append-Only: per-step log-prefix comparison per leadership. Log Matching:
+pairwise sweep every 25 sim-ms + at quiescence. State Machine Safety:
+every apply vs a global index → (entry, result) record — re-applies after
+recovery are checked against pre-crash history, and result equality
+additionally checks replica determinism. Leader Completeness +
+no-lost-commit: `CommitChecker` extends a global committed record from
+every node's `commitIndex` each step, flags any committed entry changing
+on any node, and at every election win asserts the winner holds the whole
+record; at run end every acked `(clientId, seqNo)` must appear in the
+committed log.
+
+### Linearizability checker (decision: per-key WGL)
+
+History = one `ClientOp` per `(clientId, seqNo)` — invocation at first
+send, response at the OK (dedup makes a retried op one logical operation;
+its effect provably falls inside that window: proposed after invocation,
+acked only after an apply). Keys are independent registers, so the history
+is partitioned by key, then a Wing&Gong/Lowe-style search per key:
+DFS over "linearize some eligible op next", where eligible means invoked
+no later than the earliest response among remaining completed ops
+(real-time order); a completed op's recorded result must exactly match the
+sequential model (a mirror of `KVStateMachine::applyOp`, including CAS's
+absent-means-"" and APPEND returning the whole new value — APPEND results
+make lost updates directly visible); incomplete ops may linearize anywhere
+after invocation or never. Memoized on (linearized-set bitmask, register
+value); accepted when all completed ops are linearized. Sound by
+construction — it only ever accepts a real linearization. Self-validated
+both ways: known-good histories (sequential, validly-concurrent, pending-
+op-took-effect, absent-vs-empty edge cases) accepted; hand-crafted bad
+ones (stale read, ghost read, value moving backwards, impossible CAS, lost
+APPEND update, ignored completed write) rejected.
+
+### Seed/replay workflow
+
+`ctest` runs the suite at seeds 1–20 (plus the fault-layer units, checker
+self-tests, determinism test, and Figure 8); a 300-seed sweep of the same
+configuration passed clean before the phase gate. Any failing seed prints
+itself plus the exact replay line; `chaos_sim`'s defaults are the ctest
+suite's options, so replay is exactly:
+
+```
+./build/faults/chaos_sim --seed N          # add --trace for the full run log
+```
+
+`chaos_sim --seed 1` is itself a ctest case so the replay path can't rot.
+Schedule shrinking/minimization: not implemented (optional per spec);
+the trace plus determinism makes manual minimization workable.
+
+### Figure 8 (Phase 3 deferral closed)
+
+`figure8_sim_test.cpp` builds the paper's five-server scenario
+deterministically — fixed per-node election timeouts (min == max) script
+every election winner; partitions do the rest. Both branches are asserted
+from one shared fixture: the old-term entry sits on a majority while
+`commitIndex` provably stays put across 500 heartbeat-rich ms; then (a)
+the overwrite branch — a rejoining higher-term leader that never saw the
+entry destroys it on a majority, legal precisely because replica count
+never committed it; and (b) the commit branch — a current-term entry on
+top commits it indirectly, after which it survives the disruptor's
+rejoin. The run-wide checkers (notably `CommitChecker`) stay green through
+both, which is the point: counting replicas of old-term entries is the bug
+this design rule kills, and the harness can now demonstrate it end to end.
+
+## The performance layer (Phase 7)
+
+### Thread topology (decision point 2)
+
+Four threads per node in the real runtime (`src/runtime/node_runtime.*`),
+connected by hand-written lock-free rings; the Raft core remains the single
+owner of Raft state (the Phase 2 invariant), and **all** of this is invisible
+to the simulator, which still drives `RaftCore` directly with zero threads:
+
+```
+transport I/O thread ──(inbound MPSC)──▶ Raft thread
+  (rx: read+decode)                (sole owner of RaftCore;
+                                    ClientService requests/batching)
+                                       │                 │
+                              (raftTx SPSC)      (apply SPSC, lossless)
+                                       │                 │
+                                       ▼                 ▼
+                                  tx thread ◀─(applyTx SPSC)─ apply thread
+                              (socket writes)        (sm.apply + replies)
+```
+
+- Outbound messages are **encoded on the producing thread** (Raft or apply)
+  directly into a ring slot's frame buffer; the tx thread only does socket
+  writes, so a slow peer can never stall Raft logic.
+- The committed→apply ring is **lossless**: a committed entry must reach the
+  state machine exactly once, in order. Full means the sink REFUSES — the
+  core stops advancing `lastApplied` and the Raft loop's `pumpApply()`
+  re-offers the entry once the apply thread frees a slot, so **the Raft
+  thread never blocks on the state machine**: a slow apply delays client
+  replies, never heartbeats or elections. (The first cut blocked here; a
+  group-commit burst into a slow SM could stall the Raft thread past the
+  election timeout — caught in review, redesigned, and pinned by the
+  slow-apply cluster test, which demonstrably fails against the blocking
+  version with a spurious election.) Both tx rings and the inbound ring
+  **drop** when full: Raft messages and client requests/replies are
+  loss-tolerant by design (timers and client retries are the recovery path,
+  identical to an unreachable peer).
+- One rx and one tx thread (not split): loopback writes are cheap; the
+  measured bottleneck was never the socket thread.
+- Apply on its own thread via a new `RaftCore::setApplySink` seam: when set,
+  `applyCommitted()` hands `(index, entry)` over in index order instead of
+  applying inline. The sim never sets it, so its apply path is untouched.
+- `ClientService` accordingly became thread-aware: `onClientRequest` stays
+  on the Raft thread; `onApplied` runs on the apply thread, so the pending
+  table is mutex-guarded (uncontended in sim/legacy) and the leader hint it
+  needs is cached in an atomic refreshed on the Raft thread — the apply
+  thread never touches live core state. Pending insert/apply ordering is
+  safe without further coordination because a commit needs a peer ack that
+  can only be handled after `onClientRequest` returns (one event at a time
+  on the Raft thread); a 1-node cluster would violate this, the spec's
+  topology is 3 nodes.
+- `RaftEventLoop` (Phase 2's mutex+condvar loop) is kept compilable as the
+  bench's `--runtime legacy` baseline; `raft_node`, the TCP test harness,
+  and the bench default all run the threaded runtime.
+
+### Ring buffers (decision point 1) and memory-ordering rationale (point 5)
+
+Both rings live in `src/runtime/{spsc,mpsc}_ring.h`: bounded, power-of-two
+capacity, zero allocation after construction, cache-line-padded indices,
+TSan-clean under the high-iteration `ring_tests` stress.
+
+**SPSC** — Lamport ring with monotonic 64-bit indices (slot = `index & mask`,
+no wasted slot) plus cached opposite indices so each side touches the other's
+cache line only when the ring looks full/empty, not per operation.
+Orderings: the producer publishes a slot with `tail.store(release)` pairing
+with the consumer's `tail.load(acquire)` (slot contents visible before they
+are read); the consumer retires with `head.store(release)` pairing with the
+producer's `head.load(acquire)` (move-out happens-before overwrite). Each
+side reads its own index relaxed (it is that atomic's only writer). No
+seq_cst anywhere: there is no invariant beyond those two pairwise edges.
+
+**MPSC** — Vyukov bounded array MPMC restricted to one consumer: each cell
+carries a sequence number encoding its state; producers claim positions with
+a relaxed CAS on `enqueuePos` (the CAS only arbitrates ownership — all data
+visibility flows through the cell's seq, exactly Vyukov's design), publish
+with `cell.seq.store(release)`, and the consumer recycles cells with a
+release store one lap ahead; both sides read seq with acquire. The dequeue
+position is plain non-atomic state — single consumer by contract.
+
+In-place `tryProduce(fill)`/`tryConsume(use)` variants write/read slots where
+they live, which makes **the ring itself the buffer pool** (see allocation
+discipline below).
+
+### Blocking vs busy-spin waits (decision point 4)
+
+Consumers choose per `NodeRuntimeConfig::waitMode` (`raft_node --wait
+block|spin`, default block):
+
+- **Block** — a `WakeGate` per consumer: an event-count packing
+  `epoch<<32|waiters` in ONE atomic, RMW'd seq_cst by both sides. The two
+  RMWs on the same variable are totally ordered, which closes the classic
+  missed-wakeup race *without* `atomic_thread_fence` — deliberately, because
+  TSan cannot model fences and GCC's `-Werror=tsan` rejects them. Producer:
+  publish (ring release-store), bump epoch, notify only if waiters > 0.
+  Consumer: register waiter, re-check work, then wait on the condvar for
+  epoch change/work/deadline, with a 5 ms cap as a liveness floor. The Raft
+  thread's wait deadline is min(core timer deadline, batch linger deadline).
+- **Spin** — `SpinBackoff` escalation: ~4096 `pause` instructions (a few µs
+  hot), then 64 `yield`s (plays fair under oversubscription), then parks
+  20 µs per iteration so an idle cluster does not pin cores forever.
+
+Measured (final sweep below): block is the best default at moderate
+concurrency; spin buys the best p50 at low concurrency and the best
+throughput at high concurrency with batching, at the cost of hot cores —
+exactly the documented trade-off the knob exists for.
+
+### Batching / group commit (decision point 3)
+
+`ClientService::Batching{maxBatch, linger}` (`raft_node --batch N
+--linger-us N`, default OFF so every pre-Phase-7 path is bit-identical). The
+leader buffers validated commands and flushes via the new
+`RaftCore::proposeBatch`: one multi-entry `log_.append()` call — which the
+storage layer already treats as ONE durability point, i.e. **one fsync** —
+then one `AppendEntries` per peer. A batch flushes on size or when the
+linger deadline passes; the linger driver is the runtime's per-iteration
+service hook (`flushIfDue(now)`), which in the sim is called with the
+ManualClock — a deterministic scheduled event. Step-down between buffering
+and flush answers every buffered client NOT_LEADER, the same as an immediate
+propose failure. Equivalence is a tested property
+(`batching_equivalence_test`): a fixed 10-op workload (10 % 4 ≠ 0 forces the
+linger path) batched vs unbatched produces byte-identical replicated logs on
+all nodes and identical per-request results. The fsync knob story: with
+batching, `--fsync every|group` are equivalent by construction — every
+append call is fsynced, batching is what makes one call carry N entries.
+
+### Allocation-free steady state (§4.7)
+
+Enforced by `alloc_tests`, which overrides global `operator new`, charges
+every allocation to its thread, and asserts **zero "plumbing" allocations on
+the raft, apply, and tx threads of every node** over a multi-second steady
+window under concurrent client load (20k+ ops measured). Two accounting
+buckets (`src/metrics/alloc_gate.h`): *plumbing* (asserted zero) and
+*retained* — explicitly `AllocRetention`-tagged sites whose allocations are
+data-proportional, not message-proportional: the durable log's in-memory
+copy + serialization buffer, KV/session state inside `apply()`, and the one
+log-bound copy of each client command. What made zero possible:
+
+- ring slots written/read in place + **preallocated** slot buffers (2 KiB
+  per tx frame, 1 KiB per apply command — first-touch growth otherwise leaks
+  one allocation per slot per new high-water size, which the test caught);
+- `RaftCore` reuses one `AppendEntries` message whose entry/command buffers
+  cycle through a prefilled recycle pool (64 entries × 4 KiB), and stages
+  propose/append entries in reusable scratch vectors; `RaftLog` gained a
+  move-from-span `append()` overload and a zero-copy `entriesSpan()`;
+- `ClientService` replaced its `std::map` pending table with a fixed
+  8192-slot table keyed by `index & mask` (live indices can't collide —
+  their window is bounded by the ring sizes; a colliding *stale* entry is
+  overwritten, matching the old map's never-answered behavior), and reuses
+  its OK-reply message;
+- `KvClient` keeps its connection across **cleanly completed** exchanges
+  only — any timeout/failure closes it, so a straggler reply can never be
+  credited to a later request (the Phase 5/6 correlation guarantee holds).
+
+The **rx thread is allocation-free per message too** (review follow-up; it
+was initially left as a ~2-allocs/msg residual): the transport hands the RAW
+frame to the runtime (`Transport::setRawHandler`), which decodes straight
+into the inbound ring slot via `rpc::decodeMessageInto` — same strict
+validation as `decodeMessage` (which now delegates to it), but reusing the
+slot's existing variant alternative and salvaging buffers across alternative
+switches through a per-slot `DecodePool` (prestocked at construction). Two
+more per-wakeup sources fell out of the same hunt: `FrameAssembler::feed`
+took `const std::function&`, so the capturing rx lambda paid a type-erasure
+heap allocation per read (feed is now templated on the handler), and the
+`ioLoop` pollfd set was rebuilt without capacity reuse. The allocation test
+asserts rx plumbing ≤ a small constant — connection-lifecycle events (an
+accept after a client reconnect) legitimately allocate per CONNECTION and
+are tagged/budgeted; per-message churn would register in the thousands.
+
+### One perf bug found and fixed en route: the AE↔ack storm
+
+Under concurrent load the leader sustained >170k msgs/s for ~400 client
+ops/s, latency growing with queue depth. Cause: `onAppendEntriesReply`
+re-sent AppendEntries on EVERY success ack while any entry was unacked —
+duplicate acks (from the pipelined propose-time AEs) spawned redundant AEs,
+each spawning another ack: a self-sustaining storm. Fix: follow-up AE only
+when the ack ADVANCED matchIndex. Safety unaffected (Raft tolerates
+arbitrary duplication/loss; heartbeats remain the retransmission backstop) —
+the whole chaos suite stays green, and the rule is pinned by a dedicated
+regression test (duplicate/stale acks send nothing; the heartbeat carries
+the retransmission). Measured: 182 → 6,410 ops/s, p50
+24 ms → 0.6 ms at 4 clients. Also: accepted sockets now set TCP_NODELAY for
+parity with outbound ones — measured NO delta on this workload; recorded as
+config hygiene, not an optimization.
+
 ## Optimizations (before/after measurements)
 
-*(None yet — performance layer is Phase 7.)*
+Workload: `bench/phase7_bench` (in-process 3-node cluster, closed-loop
+PUT clients, 16-byte values; data dirs on tmpfs unless noted), medians of 3×
+via `bench/phase7_sweep.sh` where given. This laptop (i5-1235U, 2P+8E cores)
+is thermally noisy: only numbers within one sweep are comparable; the
+rigorous pinned harness is Phase 8.
+
+| change | configuration | before | after |
+|---|---|---|---|
+| AE-storm fix (ack-advance resend rule) | 4 clients, legacy | 182 ops/s, p50 24 ms | 6,410 ops/s, p50 0.61 ms |
+| client connection reuse | 4 clients, threaded (interleaved A/B) | 4,930 ops/s | 7,510 ops/s (+52%) |
+| thread split + rings, block wait | 4 clients | legacy: 16.9k ops/s, p99 2.95 ms | 24.2k ops/s (+43%), p99 291 µs (10×) |
+| thread split + rings, spin wait | 8 clients | legacy: 11.4k ops/s, p99 14.2 ms | 19.8k ops/s (+74%), p99 1.26 ms (11×) |
+| busy-spin vs block (within threaded) | 1 client p50 | block 75 µs | spin 70 µs (legacy two-hop loop: 53 µs — fewer hops win at zero concurrency; documented trade-off) |
+| group commit batch=8 + spin | 8 clients, tmpfs | legacy 11.4k ops/s | 30.9k ops/s (2.7×), p50 227 µs, p99 852 µs |
+| group commit batch=4 | 4 clients, **btrfs disk** (fsync-bound) | 376 ops/s, p50 10.0 ms | 619 ops/s, p50 6.6 ms |
+| group commit batch=16, 16 clients | **btrfs disk** | 376 ops/s (legacy) | 2,159 ops/s (5.7×), p50 7.1 ms |
+| allocation-free steady state | alloc_tests, ~17k-op window | raft ~2.4k, rx ~8.2/msg plumbing allocs | **0** plumbing allocs on raft/apply/tx AND per-message rx, all nodes |
+
+Known honest caveats: (a) at zero concurrency the extra pipeline hops cost
+~20 µs p50 vs the legacy loop; (b) batch size must be ≤ offered concurrency
+or the linger dominates (batch=8 at 4 clients regresses — the knee-of-curve
+sweep is a Phase 8 deliverable); (c) the bench runs 3 nodes in ONE process
+(12 pipeline threads on 12 hybrid cores), which understates the threaded
+runtime relative to one-process-per-node production.
 
 ## Parked non-goals
 
@@ -482,3 +949,105 @@ was wrong. A manual 3-process run confirmed `kill -9` of the leader and
 restart recovers `term/votedFor` from disk and rejoins at the new term.
 Release, ASan/UBSan, and TSan gates all green via `./build_and_test.sh`
 (83 cases, 1251 assertions in the unit binary).
+
+**Phase 5 — Client sessions, exactly-once dedup, KV store (2026-06-11).**
+Real client path end to end: `KVStateMachine` (PUT/GET/DELETE/CAS plus the
+non-idempotent APPEND probe) with the `(clientId, seqNo) -> (lastSeq,
+lastResult)` session table inside its applied (and serializable) state,
+dedup at apply time on every replica; `ClientService` per node on two new
+logic-free RaftCore seams (client-request handler, apply observer) doing
+redirect-with-hint, propose-verbatim with identity validation, and
+commit-then-applied-then-reply via an index-keyed pending table with an
+entry-identity check for overwritten proposals; synchronous `KvClient`
+(same-identity retries, hint following, bounded rotation) plus a `kv_cli`
+executable; transport gained inbound reply routing for non-peer (client)
+connections. Decision points: reads through the log, client-supplied u64
+ids, no eviction (determinism constraint recorded), no leader
+short-circuit — all documented above. Two bugs caught by tests en route:
+ClientService originally prepended the session prefix a second time onto
+already-prefixed commands (every apply returned malformed) — fixed by
+making the client own the full command bytes and the server validate the
+embedded identity instead; and a sim-test predicate wrongly expected a
+unique leader while the deposed one was isolated. Tests: 7 KV/dedup unit
+cases (incl. serialize round-trip keeping dedup effective), 5 deterministic
+sim cases (clean run, redirect hint, exactly-once across failover,
+10× retry storm, overwritten-pending → NOT_LEADER), 4 real-TCP KvClient
+cases (clean run, follower redirect, exactly-once across leader kill, retry
+storm), and a manual 3-process `kv_cli` smoke incl. leader `kill -9` with
+the client succeeding through failover. Release, ASan/UBSan, and TSan gates
+all green via `./build_and_test.sh` (95 unit cases / 1409 assertions, plus
+3 raft-cluster and 4 kv-cluster TCP cases).
+
+**Phase 6 — Fault injection, invariant checking, seeded chaos (2026-06-11).**
+Deterministic single-process simulator in `faults/`: `SimNetwork` (seeded
+in-memory bus with drop/latency/reorder/partition), `SimHarness` (virtual-
+time scheduler driving production RaftCore + real durable storage +
+KVStateMachine + ClientService — no threads, no code changes to any of
+them), protocol-faithful `SimClient`s with per-attempt reply correlation,
+a seeded fault schedule (partitions, drops, delays, reorders, crashes,
+restarts, leader kills), the five-invariant checkers plus no-lost-commit
+(continuous, pure-data, every one self-validated against fabricated
+violations), and a per-key WGL linearizability checker self-validated on
+known-good and known-bad histories — all documented in the Phase 6 section
+above. The chaos driver (`runChaos`, CLI `chaos_sim --seed N`) runs the
+seeded workload + fault schedule, heals, then asserts invariants,
+no-lost-commit, linearizability, and post-heal convergence; ctest runs
+seeds 1–20 plus the determinism test (same seed ⇒ line-identical run
+trace), fault-layer units, checker self-tests, and the five-node Figure 8
+scenario closing the Phase 3 deferral (old-term majority entry provably
+uncommitted; overwritten in one branch, indirectly committed in the
+other). One workload bug caught and fixed en route: the first cut finished
+all client ops before the first fault fired (committed ≈ acked, no retry
+duplicates) — seeded think time now spreads ops across the fault window,
+and committed > acked on many seeds shows dedup being exercised. A
+300-seed sweep passed clean. Release, ASan/UBSan, and TSan gates all green
+via `./build_and_test.sh` (faults_tests: 17 cases / 7010 assertions, plus
+the `chaos_sim --seed 1` replay-path ctest case).
+
+**Phase 7 — The performance layer (2026-06-11).** Re-plumbed the real
+runtime for latency/throughput with correctness frozen: hand-written
+lock-free SPSC and Vyukov-style MPSC rings (cache-line-padded, bounded,
+allocation-free, per-atomic ordering rationale in-header, TSan-clean under
+a 2M-op concurrent stress); a four-thread split per node (rx → Raft →
+{tx, apply}) behind a new `NodeRuntime`, with the core still single-owner
+via the `setApplySink` seam and sends encoded on the producing thread;
+group commit (`proposeBatch` = one fsync + one AE per peer, size/linger
+policy, deterministic linger in sim, equivalence test proving identical
+logs and results batched vs unbatched); blocking (fence-free event-count
+WakeGate) and busy-spin (pause→yield→park) wait modes, both flag-selectable
+and measured; and an allocation-free steady state — ring-slot buffer pools,
+core message/entry scratch + recycle pools, a flat pending table, client
+connection reuse — enforced by a global-new-override test asserting ZERO
+plumbing allocations on every pipeline thread (rx decode is the documented
+residual). En route, found and fixed a real perf bug (the AE↔ack resend
+storm: 35× throughput at 4 clients) and switched the Phase 5 TCP test
+harness + `raft_node` to the threaded runtime, so the entire cluster suite
+and TSan gate exercise the new topology; the sim and chaos suites are
+untouched and green, including determinism. All before/after numbers in the
+optimization table above; headline: +43% throughput with 10× better p99 at
+4 clients (block), 2.7× at 8 clients with batching+spin, 5.7× on fsync-bound
+disk with batch=16, at a documented ~20 µs single-client p50 cost vs the old
+loop. Release, ASan/UBSan, and TSan gates all green via
+`./build_and_test.sh` (8 ctest targets per config, incl. ring stress,
+batching equivalence, allocation test, and a batched concurrent-client
+TSan stress).
+
+**Phase 7 addendum — review follow-ups (2026-06-11).** Three changes from
+the phase review, all gated green (Release + ASan/UBSan + TSan, 8/8): (1)
+the AE↔ack storm fix is now pinned by a regression unit test (duplicate and
+stale success acks send nothing; the heartbeat is the only retransmitter).
+(2) Apply backpressure redesigned from blocking to refusal + `pumpApply()`:
+the Raft thread never blocks on a slow state machine; the new slow-apply
+cluster test (apply ring capacity 2, 25 ms per apply, 16 batched clients)
+holds leadership at a constant term through sustained refusals — and was
+validated to FAIL against the old blocking sink, which stalls the Raft
+thread ~350 ms inside one group-commit hand-off and triggers a spurious
+election. (3) The rx-decode allocation residual was eliminated rather than
+accepted: raw-frame ingress + `decodeMessageInto` with per-slot buffer
+pools (equivalence with `decodeMessage` proven by a cycling round-trip
+test), a templated `FrameAssembler::feed` (the per-read std::function
+type-erasure allocation), and a reused pollfd set; the allocation test now
+asserts rx ≈ 0 (small per-connection budget) alongside the strict zero on
+raft/apply/tx. Also recorded: the repo-structure finding that the outer
+repo tracks `raft-rsm` as a bare gitlink, so phase commits must land in the
+inner repo first — Phases 5–7 content had been sitting uncommitted.

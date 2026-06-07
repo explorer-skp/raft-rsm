@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <variant>
 
+#include "metrics/alloc_gate.h"
 #include "raft/logging.h"
 
 namespace rsm::raft {
@@ -63,7 +64,24 @@ RaftCore::RaftCore(NodeId self, std::vector<NodeId> peers,
       clock_(clock),
       cfg_(cfg),
       send_(std::move(send)),
-      rng_(rngSeed) {}
+      rng_(rngSeed) {
+    // Preallocate the hot-path scratch pools (spec §4.7): enough entry
+    // shells and command buffers for any steady-state batch, so the
+    // propose/replicate cycle never allocates from the very first message.
+    // Bigger one-off traffic (a long catch-up resend) grows them once and
+    // the capacity sticks.
+    constexpr std::size_t kScratchEntries = 64;
+    constexpr std::size_t kScratchCommandBytes = 4096;
+    auto& ae = std::get<rsm::rpc::AppendEntries>(aeMsg_);
+    ae.entries.reserve(kScratchEntries);
+    entryScratch_.reserve(kScratchEntries);
+    cmdPool_.reserve(kScratchEntries);
+    for (std::size_t i = 0; i < kScratchEntries; ++i) {
+        std::vector<std::uint8_t> buf;
+        buf.reserve(kScratchCommandBytes);
+        cmdPool_.push_back(std::move(buf));
+    }
+}
 
 void RaftCore::start() {
     resetElectionTimer();
@@ -146,13 +164,34 @@ void RaftCore::sendHeartbeats() {
 
 void RaftCore::sendAppendEntries(NodeId peer) {
     const LogIndex next = nextIndex_[peer];
-    AppendEntries ae;
+    // The AE message object is a reused member: its entries' command
+    // buffers cycle through cmdPool_ when the entry count shrinks (e.g.
+    // heartbeats between batches), so steady state sends allocate nothing.
+    // Hot path; same bytes on the wire as building a fresh message.
+    auto& ae = std::get<AppendEntries>(aeMsg_);
     ae.term = persist_.currentTerm();
     ae.leaderId = self_;
     ae.prevLogIndex = next - 1;
     ae.prevLogTerm = log_.termAt(next - 1);
     ae.leaderCommit = commitIndex_;
-    ae.entries = log_.entriesFrom(next);
+    const auto src = log_.entriesSpan(next);
+    while (ae.entries.size() > src.size()) {
+        cmdPool_.push_back(std::move(ae.entries.back().command));
+        ae.entries.pop_back();
+    }
+    while (ae.entries.size() < src.size()) {
+        rsm::rpc::LogEntry e;
+        if (!cmdPool_.empty()) {
+            e.command = std::move(cmdPool_.back());
+            cmdPool_.pop_back();
+        }
+        ae.entries.push_back(std::move(e));
+    }
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        ae.entries[i].term = src[i].term;
+        ae.entries[i].command.assign(src[i].command.begin(),
+                                     src[i].command.end());
+    }
     raftLog(LogLevel::Debug,
             "[raft] node=%u term=%llu append-> peer=%u prev=%llu n=%zu "
             "commit=%llu",
@@ -160,13 +199,18 @@ void RaftCore::sendAppendEntries(NodeId peer) {
             static_cast<unsigned long long>(ae.prevLogIndex),
             ae.entries.size(),
             static_cast<unsigned long long>(ae.leaderCommit));
-    send_(peer, Message{std::move(ae)});
+    send_(peer, aeMsg_);
 }
 
 std::optional<LogIndex> RaftCore::propose(std::vector<std::uint8_t> command) {
     if (role_ != Role::Leader) return std::nullopt;
     const Term cur = persist_.currentTerm();
-    log_.append({rsm::rpc::LogEntry{cur, std::move(command)}});
+    // Stage in the reusable scratch and move through to the log: the
+    // command buffer is allocated once (by the caller) and retained by the
+    // log; nothing else on this path allocates in steady state.
+    entryScratch_.clear();
+    entryScratch_.push_back(rsm::rpc::LogEntry{cur, std::move(command)});
+    log_.append(std::span<rsm::rpc::LogEntry>(entryScratch_));
     const LogIndex idx = log_.lastIndex();
     raftLog(LogLevel::Debug, "[raft] node=%u term=%llu appended index=%llu",
             self_, static_cast<unsigned long long>(cur),
@@ -175,6 +219,32 @@ std::optional<LogIndex> RaftCore::propose(std::vector<std::uint8_t> command) {
     for (const NodeId peer : peers_) sendAppendEntries(peer);
     heartbeatDeadline_ = clock_.now() + cfg_.heartbeatInterval;
     return idx;
+}
+
+std::optional<LogIndex> RaftCore::proposeBatch(
+    std::vector<std::vector<std::uint8_t>>& commands) {
+    if (commands.empty() || role_ != Role::Leader) return std::nullopt;
+    const Term cur = persist_.currentTerm();
+    // The command buffers move out of the caller's container (which keeps
+    // its capacity for the next batch) through the scratch into the log.
+    entryScratch_.clear();
+    for (auto& c : commands) {
+        entryScratch_.push_back(rsm::rpc::LogEntry{cur, std::move(c)});
+    }
+    const std::size_t n = entryScratch_.size();
+    // One append call == one durability point == one fsync (group commit);
+    // persist-before-send holds exactly as in propose().
+    log_.append(std::span<rsm::rpc::LogEntry>(entryScratch_));
+    const LogIndex first = log_.lastIndex() - n + 1;
+    raftLog(LogLevel::Debug,
+            "[raft] node=%u term=%llu appended batch [%llu, %llu]", self_,
+            static_cast<unsigned long long>(cur),
+            static_cast<unsigned long long>(first),
+            static_cast<unsigned long long>(log_.lastIndex()));
+    advanceCommit();  // a 1-node cluster commits immediately
+    for (const NodeId peer : peers_) sendAppendEntries(peer);
+    heartbeatDeadline_ = clock_.now() + cfg_.heartbeatInterval;
+    return first;
 }
 
 void RaftCore::resetElectionTimer() {
@@ -215,9 +285,18 @@ void RaftCore::handle(const Envelope& env, const Message& m) {
                 onAppendEntries(env.from, msg);
             } else if constexpr (std::is_same_v<T, AppendEntriesReply>) {
                 onAppendEntriesReply(env.from, msg);
+            } else if constexpr (std::is_same_v<T, rsm::rpc::ClientRequest>) {
+                if (onClientRequest_) {
+                    onClientRequest_(env.from, msg);
+                } else {
+                    raftLog(LogLevel::Debug,
+                            "[raft] node=%u dropping client request "
+                            "(no handler registered)",
+                            self_);
+                }
             } else {
                 raftLog(LogLevel::Debug,
-                        "[raft] node=%u dropping client message (Phase 5)",
+                        "[raft] node=%u dropping unexpected client reply",
                         self_);
             }
         },
@@ -324,8 +403,16 @@ void RaftCore::onAppendEntries(NodeId from, const AppendEntries& ae) {
         }
     }
     if (i < ae.entries.size()) {
-        log_.append({ae.entries.begin() + static_cast<std::ptrdiff_t>(i),
-                     ae.entries.end()});
+        // Copy the new suffix into the scratch (these copies are the
+        // follower's retained log bytes) and move it into the log.
+        entryScratch_.clear();
+        {
+            const rsm::metrics::AllocRetention allocTag;
+            entryScratch_.assign(
+                ae.entries.begin() + static_cast<std::ptrdiff_t>(i),
+                ae.entries.end());
+        }
+        log_.append(std::span<rsm::rpc::LogEntry>(entryScratch_));
     }
 
     // Advance follower commit, capped at the last index this RPC vouches
@@ -364,8 +451,15 @@ void RaftCore::onAppendEntriesReply(NodeId from, const AppendEntriesReply& r) {
                     from, static_cast<unsigned long long>(ack),
                     static_cast<unsigned long long>(ack + 1));
             advanceCommit();
+            // Continue the catch-up only when this ack moved the window:
+            // resending on every duplicate ack turns the pipelined
+            // propose-time AEs into a self-amplifying AE<->ack storm under
+            // concurrent load (measured: the leader sustained >170k msgs/s
+            // for ~400 client ops/s, latency growing with queue depth).
+            // Liveness is unaffected: a lost AE is retransmitted by the
+            // next heartbeat, exactly as for any dropped message.
+            if (nextIndex_[from] <= log_.lastIndex()) sendAppendEntries(from);
         }
-        if (nextIndex_[from] <= log_.lastIndex()) sendAppendEntries(from);
         return;
     }
 
@@ -422,10 +516,25 @@ void RaftCore::advanceCommit() {
 
 void RaftCore::applyCommitted() {
     while (lastApplied_ < commitIndex_) {
-        ++lastApplied_;
-        sm_.apply(log_.entryAt(lastApplied_).command);
+        const LogIndex next = lastApplied_ + 1;
+        const rsm::rpc::LogEntry& entry = log_.entryAt(next);
+        if (applySink_) {
+            // Phase 7 hand-off: committed entries leave the core in index
+            // order; the runtime's apply thread performs sm_.apply. Nothing
+            // about WHAT gets applied changes — only where. A refusal
+            // (apply backpressure) stops the hand-off WITHOUT advancing
+            // lastApplied_: the entry is re-offered by the runtime's
+            // pumpApply() — the Raft thread never blocks on the state
+            // machine, so heartbeats and elections stay live.
+            if (!applySink_(next, entry)) return;
+            lastApplied_ = next;
+            continue;
+        }
+        lastApplied_ = next;
+        const std::string result = sm_.apply(entry.command);
         raftLog(LogLevel::Debug, "[raft] node=%u applied index=%llu", self_,
                 static_cast<unsigned long long>(lastApplied_));
+        if (onApply_) onApply_(lastApplied_, entry, result);
     }
 }
 

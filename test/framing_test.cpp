@@ -20,7 +20,9 @@ std::vector<std::uint8_t> makeFrame(const std::vector<std::uint8_t>& body) {
 
 struct Collector {
     std::vector<std::vector<std::uint8_t>> frames;
-    FrameAssembler::FrameHandler handler() {
+    // feed() is templated on the handler now (no std::function); a lambda
+    // binding works the same for the tests.
+    auto handler() {
         return [this](std::span<const std::uint8_t> body) {
             frames.emplace_back(body.begin(), body.end());
         };

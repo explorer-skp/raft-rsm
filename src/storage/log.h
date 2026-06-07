@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -13,7 +14,7 @@ using rsm::rpc::LogEntry;
 using rsm::rpc::LogIndex;
 using rsm::rpc::Term;
 
-// The replicated log behind the seam Phase 4 will make durable.
+// The replicated log behind the seam Phase 4 made durable.
 //
 // Indexing convention (used everywhere in this project): indices are
 // 1-based. Index 0 is the empty sentinel — an empty log has lastIndex() == 0
@@ -22,11 +23,19 @@ using rsm::rpc::Term;
 struct RaftLog {
     // Appends at lastIndex()+1 onward.
     virtual void append(std::vector<LogEntry> entries) = 0;
+    // Phase 7 hot-path variant: MOVES each entry out of the caller's span,
+    // leaving reusable shells behind — the caller's container keeps its
+    // capacity, so a steady-state propose/replicate cycle allocates nothing
+    // here beyond the log's own retained storage.
+    virtual void append(std::span<LogEntry> entries) = 0;
     // Term of the entry at i; 0 for i == 0. Precondition: i <= lastIndex().
     virtual Term termAt(LogIndex i) const = 0;
     virtual const LogEntry& entryAt(LogIndex i) const = 0;  // 1 <= i <= last
     // All entries in [i, lastIndex()]; empty if i > lastIndex().
     virtual std::vector<LogEntry> entriesFrom(LogIndex i) const = 0;
+    // Zero-copy view of [i, lastIndex()] (Phase 7). Invalidated by any log
+    // mutation; use within one event-handler call only.
+    virtual std::span<const LogEntry> entriesSpan(LogIndex i) const = 0;
     // Deletes [i, lastIndex()]. No-op if i > lastIndex().
     virtual void truncateSuffixFrom(LogIndex i) = 0;
     virtual LogIndex lastIndex() const = 0;
@@ -37,9 +46,11 @@ struct RaftLog {
 class InMemoryLog final : public RaftLog {
 public:
     void append(std::vector<LogEntry> entries) override {
-        entries_.insert(entries_.end(),
-                        std::make_move_iterator(entries.begin()),
-                        std::make_move_iterator(entries.end()));
+        append(std::span<LogEntry>(entries));
+    }
+
+    void append(std::span<LogEntry> entries) override {
+        for (auto& e : entries) entries_.push_back(std::move(e));
     }
 
     Term termAt(LogIndex i) const override {
@@ -59,6 +70,12 @@ public:
         if (i > lastIndex()) return {};
         return {entries_.begin() + static_cast<std::ptrdiff_t>(i - 1),
                 entries_.end()};
+    }
+
+    std::span<const LogEntry> entriesSpan(LogIndex i) const override {
+        if (i < 1) i = 1;
+        if (i > lastIndex()) return {};
+        return {entries_.data() + (i - 1), entries_.size() - (i - 1)};
     }
 
     void truncateSuffixFrom(LogIndex i) override {

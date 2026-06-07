@@ -95,3 +95,53 @@ TEST_CASE("encode fails cleanly into a too-small buffer") {
     CHECK(encodeMessage(1, 2, m, small) == 0);
     CHECK(encodeMessage(1, 2, m, std::span<std::uint8_t>{}) == 0);
 }
+
+TEST_CASE("decodeMessageInto: one reused (message, pool) pair cycling "
+          "through all types matches fresh decodes exactly") {
+    using rsm::rpc::DecodedMessage;
+    using rsm::rpc::DecodePool;
+    using rsm::rpc::Message;
+
+    // A mixed message sequence with type alternation and varying entry
+    // counts/sizes — the exact pattern the inbound-ring slots see.
+    std::vector<Message> seq;
+    seq.push_back(Message{rsm::rpc::AppendEntries{
+        5, 1, 9, 4, 7,
+        {{5, {1, 2, 3}}, {5, std::vector<std::uint8_t>(100, 0xAB)}}}});
+    seq.push_back(Message{rsm::rpc::AppendEntriesReply{5, true, 11, 0}});
+    seq.push_back(Message{rsm::rpc::ClientRequest{
+        77, 3, std::vector<std::uint8_t>(64, 0x5C)}});
+    seq.push_back(Message{rsm::rpc::AppendEntries{6, 2, 0, 0, 0, {}}});
+    seq.push_back(Message{rsm::rpc::ClientReply{
+        rsm::rpc::ClientStatus::Ok, 2, {0x4F, 0x42}}});
+    seq.push_back(Message{rsm::rpc::AppendEntries{
+        6, 2, 11, 5, 11, {{6, {9}}}}});
+    seq.push_back(Message{rsm::rpc::RequestVote{7, 3, 12, 6}});
+    seq.push_back(Message{rsm::rpc::RequestVoteReply{7, false}});
+
+    DecodedMessage reused;
+    DecodePool pool;
+    for (int round = 0; round < 3; ++round) {  // pool warm by round 2
+        for (std::size_t i = 0; i < seq.size(); ++i) {
+            CAPTURE(round);
+            CAPTURE(i);
+            std::vector<std::uint8_t> frame(rsm::rpc::encodedSize(seq[i]));
+            REQUIRE(rsm::rpc::encodeMessage(1, 2, seq[i], frame) ==
+                    frame.size());
+            REQUIRE(rsm::rpc::decodeMessageInto(frame, reused, pool));
+            const auto fresh = rsm::rpc::decodeMessage(frame);
+            REQUIRE(fresh.has_value());
+            CHECK(reused.envelope == fresh->envelope);
+            CHECK(reused.message == fresh->message);
+        }
+    }
+
+    // A malformed frame is still rejected, and the pair stays usable.
+    std::vector<std::uint8_t> good(rsm::rpc::encodedSize(seq[0]));
+    REQUIRE(rsm::rpc::encodeMessage(1, 2, seq[0], good) == good.size());
+    auto bad = good;
+    bad.pop_back();  // truncated payload
+    CHECK_FALSE(rsm::rpc::decodeMessageInto(bad, reused, pool));
+    REQUIRE(rsm::rpc::decodeMessageInto(good, reused, pool));
+    CHECK(reused.message == seq[0]);
+}

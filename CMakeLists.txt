@@ -35,6 +35,8 @@ target_include_directories(doctest INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_p
 find_package(Threads REQUIRED)
 
 add_subdirectory(src)
+add_subdirectory(faults)
+add_subdirectory(bench)
 
 enable_testing()
 add_subdirectory(test)
