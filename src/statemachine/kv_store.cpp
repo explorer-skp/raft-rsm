@@ -42,13 +42,20 @@ Command encodeKvCommand(std::uint64_t clientId, std::uint64_t seqNo, KvOp op,
                         const std::string& key, const std::string& arg,
                         const std::string& arg2) {
     Command cmd;
-    putU64(cmd, clientId);
-    putU64(cmd, seqNo);
-    cmd.push_back(static_cast<std::uint8_t>(op));
-    putString(cmd, key);
-    if (opNeedsArg(op)) putString(cmd, arg);
-    if (op == KvOp::Cas) putString(cmd, arg2);
+    encodeKvCommandInto(cmd, clientId, seqNo, op, key, arg, arg2);
     return cmd;
+}
+
+void encodeKvCommandInto(Command& out, std::uint64_t clientId,
+                         std::uint64_t seqNo, KvOp op, const std::string& key,
+                         const std::string& arg, const std::string& arg2) {
+    out.clear();
+    putU64(out, clientId);
+    putU64(out, seqNo);
+    out.push_back(static_cast<std::uint8_t>(op));
+    putString(out, key);
+    if (opNeedsArg(op)) putString(out, arg);
+    if (op == KvOp::Cas) putString(out, arg2);
 }
 
 std::string KVStateMachine::apply(const Command& cmd) {

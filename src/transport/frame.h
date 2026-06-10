@@ -62,6 +62,14 @@ public:
         return true;
     }
 
+    // Discards buffered bytes and clears the poison flag, keeping the
+    // buffer's capacity — for reusing one assembler across connections
+    // (Phase 8 client hot path) without per-connection allocations.
+    void reset() {
+        buf_.clear();
+        poisoned_ = false;
+    }
+
 private:
     std::vector<std::uint8_t> buf_;
     bool poisoned_ = false;

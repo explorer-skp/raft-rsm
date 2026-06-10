@@ -851,6 +851,177 @@ sweep is a Phase 8 deliverable); (c) the bench runs 3 nodes in ONE process
 (12 pipeline threads on 12 hybrid cores), which understates the threaded
 runtime relative to one-process-per-node production.
 
+## The benchmark harness (Phase 8)
+
+Governing principle: **credible numbers, not impressive-looking ones.** The
+harness is built so that the three classic ways a benchmark lies —
+coordinated omission, unreproducibility, and silently measuring a degraded
+system — are each closed off by a *tested* mechanism, not by good
+intentions. Everything below lives in `/bench` (plus its self-tests in
+`/test`); zero production-code changes beyond the client-buffer reuse noted
+at the end.
+
+### Topology decision: instrumented in-process cluster
+
+The system under test is the full production wiring — per node: TCP
+transport on a loopback port, durable storage, `KVStateMachine`,
+`ClientService`, `RaftCore`, the Phase 7 threaded `NodeRuntime` — built
+**in one process** (`bench/bench_cluster.*`), exactly like the TCP test
+harness and `phase7_bench`. Rationale: the spec's production topology is
+already "3 processes on ONE host over loopback TCP", so the host-level
+contention picture (total threads, cores, loopback sockets) is identical;
+the pipeline is allocation-free so there is no hidden allocator sharing;
+and in-process is what lets every instrument below attach through existing
+seams instead of adding control RPCs to `raft_node`. Recorded as a
+methodology caveat in the README.
+
+### Load generation (decision: fixed-rate open-loop + closed-loop)
+
+- **Closed-loop** (`runClosedLoop`): N clients issue→wait→issue. Used for
+  saturation throughput and *service* latency. Documented limitation: it
+  self-throttles, so it understates tail latency — never the tail source.
+- **Open-loop** (`runOpenLoop`): deterministic fixed-rate arrivals (spec
+  §7 says "fixed arrival rate"; Poisson considered and rejected — fixed
+  intervals make rate fidelity exactly checkable and match wrk2-style
+  practice), total rate R striped round-robin over T synchronous threads
+  (thread j fires at offset j/R, then every T/R). Bounded in-flight (≤ T)
+  is a documented deviation from a true open system; T is sized well above
+  the in-flight demand below saturation (48 threads for the sweeps).
+
+### Coordinated-omission correction (decision: intended-send-time)
+
+Every request's latency is measured **from its scheduled send time**, not
+its actual send time; a generator thread that falls behind issues late
+requests immediately and they record the queueing they actually suffered.
+The schedule is never edited: every op with intended time inside the window
+is issued and measured (or counted `abandoned` if the drain cap trips,
+which marks the run oversaturated and its tail a lower bound).
+HdrHistogram-style expected-interval back-fill was considered and rejected:
+back-fill reconstructs samples a closed recorder *skipped*, but this
+generator skips nothing, so back-fill would double-count. The
+actual-send-time histogram is recorded alongside as the visible "what
+coordinated omission would have reported" control.
+
+**Self-test (must bite, like the Phase 6 checker self-tests):**
+`bench_tests` injects a one-shot 500 ms stall into every node's state
+machine (`StallGate`/`StallableSM`) mid-window during an open-loop run and
+asserts the intended-time tail reports it while the actual-time tail hides
+it. Measured: intended p99 = 469.8 ms / p99.9 = 499.1 ms vs actual p99 =
+1.9 ms — a ~250× gap that IS coordinated omission, demonstrated and pinned.
+
+### Measurement path: allocation- and lock-free in steady state
+
+The Phase 7 discipline extended to the observer: the generator hot loop
+(schedule arithmetic, request/response, histogram record into the
+fixed-storage in-repo `LatencyHistogram`) performs **zero** steady-state
+heap allocations, asserted by `bench_alloc_tests` (global operator-new
+override, `loadgen` role, plumbing == 0). This required reusing buffers
+inside `KvClient` (command scratch, request `Message`, frame buffer,
+`FrameAssembler` + `reset()`, `decodeMessageInto` slot) — behavior
+identical, covered by the existing client/cluster suites.
+
+### Internal commit latency (request enqueued at leader → committed)
+
+Measured entirely **on the Raft thread**, so it needs no locks and cannot
+race: the bench's client-request-handler wrapper stamps
+`(clientId, seqNo) → t_enq` into a preallocated open-addressed table; the
+service-hook wrapper scans `core.commitIndex()` each loop iteration,
+resolves each newly committed index to its identity via the leader's own
+log (`entryAt`, zero-copy), and records `now − t_enq`. Histograms leave the
+Raft thread only via a request/ack handshake (the Raft thread copies into
+`snapOut`), so readers never race the writer — the tap adds two table
+operations per request to the Raft thread and nothing to any client path.
+
+### Leadership stability is a benchmark health signal
+
+Every node's transition observer feeds a lock-free, timestamped event log
+(`LeadershipMonitor`). Every run reports elections-in-window and the term
+trajectory; a **clean-load run with any election inside the measurement
+window is INVALID** — `rsm_bench` prints the reason, writes `valid: false`
+into the JSON, exits 3, and `run_benchmarks.sh` aborts, because an
+unexpected election is a bug to investigate (the Phase 7 lesson), not
+noise. The stress regime that exposed the apply-backpressure bug (high
+concurrency + group commit + sustained duration) is explicitly in the
+suite: a 30 s, 32-client, batch-8, busy-spin clean run must hold one
+constant term, plus a shortened ctest variant (`bench_tests`) as the
+permanent regression net.
+
+### Fault instruments
+
+`FaultGate` filters cluster-bound sends in the bench's send hook:
+probabilistic drop (per-thread xorshift; symmetric loss) and an isolation
+mask ("partition now", in-flight cross-group delivery unaffected — sender
+side only; client traffic always passes, matching the Phase 6 sim's
+clients-bypass-partitions model). Leader kill/restart reuse the Phase 4
+restart pattern (same port, durable replay, fresh volatile state).
+Failover time is client-perceived: one probe `put()` (100 ms attempts,
+internal redirects) spans the outage, so its return instant is "a new
+leader served a committed write", discovery included.
+
+### Thread pinning (decision: pin the three Raft threads only)
+
+On this 12-thread hybrid host (2 P-cores ×HT + 8 E-cores) the pipeline
+alone has 12 threads, so exclusive cores for everything do not exist.
+The Raft threads are the ones whose scheduling delay becomes elections or
+latency cliffs, so `--pin` pins exactly those, one per physical core
+(cpus 0, 2 = P-cores, 4 = E-core), self-applied via the bench's
+service-hook wrapper on first call — again no runtime changes. Everything
+else floats. Measured honestly: the suite's first-cell `pin_ab` pair is
+ORDER-CONFOUNDED (it runs before the package settles to its sustained
+power limit — see host caveat below) and is superseded by an interleaved
+warm-machine A/B (`pin_ab2.*`, 3× alternating): median throughput equal
+within noise (33.0 k/s pinned vs 32.2 k/s unpinned at 16 clients), but the
+unpinned runs show occasional large negative excursions (one rep at
+22.1 k/s, −33 %) that the pinned runs do not — pinning's measured value is
+VARIANCE control on the election-critical thread, not a mean shift.
+Pinned is the recorded default for all reported numbers.
+
+**Host caveat discovered during the run (recorded with the results):**
+this U-series laptop CPU sustains its boost clocks only briefly; under the
+suite's continuous load it settles to power-limited (PL1) sustained
+clocks. All numbers in the reported result set were collected in that
+sustained state (mutually comparable, conservative); isolated burst runs
+on an idle machine measure up to ~35 % higher (e.g. 33 k/s vs 24 k/s at 16
+clients, batch off). Peak thermal-zone temperature across all 150+ runs:
+82 °C; governor `performance` on all 12 cpus for every run (asserted from
+the per-run machine records).
+
+### Snapshotting (decision: deferred, with evidence)
+
+Unbounded log growth does not constrain this benchmark: the longest run
+(30 s stress at full batched throughput) ends well under a few hundred MB
+of log + in-memory entries across all three nodes on a 7 GB host, and
+every run starts from a fresh data dir. `rsm_bench` records `data_bytes`
+in every JSON as the standing evidence. Snapshotting + `InstallSnapshot`
+stay future work (the session table has been snapshot-ready since
+Phase 5); per the decision protocol the simpler, reversible option wins.
+
+### Reproducibility workflow
+
+One script — `bench/run_benchmarks.sh` — regenerates every reported
+number: it sets/verifies/records the CPU governor (warns loudly if not
+`performance`), captures host state (`machine.txt` + per-run
+machine-start/end blocks inside each JSON: CPU model, governor, no_turbo,
+kernel, loadavg, hottest thermal zone), builds Release, runs the full
+matrix (REPEATS× per cell, seeds printed, medians reported), writes one
+raw JSON per run, picks the headline offered load from the saved sweep
+itself (`pick_rate.py`: 70 % of the highest cleanly-sustained rate), and
+renders all plots + `summary.txt` from the saved files via
+`plot_results.py` (matplotlib — tooling, not part of the C++ deliverable).
+Per-run workload determinism (same seed ⇒ same key sequence) is
+unit-tested; open-loop rate fidelity (the generator holds the offered rate
+within tolerance when the system keeps up) is asserted in `bench_tests`.
+
+### Knobs swept
+
+batch size (1–32) × wait mode (block/spin) × client concurrency (1–32) ×
+storage (tmpfs vs real disk) for closed-loop throughput; offered rate
+sweeps for two open-loop configs (`base` = no batching + block,
+`perf` = batch 8 + spin) for the latency-vs-throughput curve and knee;
+`--fsync every|group` measured once at batch=1 on disk to demonstrate the
+documented by-construction equivalence (the real fsync knob is the batch
+size: batch=1 ⇒ fsync per entry, batch=N ⇒ one fsync per N).
+
 ## Parked non-goals
 
 Dynamic membership, snapshotting/compaction (stretch), multi-host/WAN, BFT, TLS/auth,
@@ -1031,6 +1202,46 @@ loop. Release, ASan/UBSan, and TSan gates all green via
 `./build_and_test.sh` (8 ctest targets per config, incl. ring stress,
 batching equivalence, allocation test, and a batched concurrent-client
 TSan stress).
+
+**Phase 8 — Benchmark harness and results (2026-06-11).** Rigorous
+measurement layer in `/bench` with zero production-code changes beyond
+hot-path buffer reuse inside `KvClient` (+ `FrameAssembler::reset`,
+`encodeKvCommandInto`) so the load generators are allocation-free:
+`bench_lib` = instrumented in-process cluster on the full production
+wiring through existing seams (send hook, client-request handler, service
+hook, transition observer) carrying a lock-free leadership monitor, a
+Raft-thread-only commit-latency tap with handshake export, fault gate
+(loss/partition), one-shot stall gate, and kill/restart; closed- and
+open-loop generators (fixed-rate arrivals, latency from INTENDED send
+time = the coordinated-omission correction, abandoned-schedule
+accounting); `rsm_bench` driver (closed/open/failover modes, fault flags,
+JSON raw data with machine state captured at start+end of every run,
+clean-load-election ⇒ valid=false + exit 3); `run_benchmarks.sh` (one
+script regenerates everything; governor set/record; `pick_rate.py` derives
+stated loads from the saved sweep) and `plot_results.py` (plots + summary
+from saved JSON only). Validation wired into ctest: the stall self-test
+(injected 500 ms SM stall: intended p99 = 470 ms vs actual-send p99 =
+1.9 ms — the correction shown to bite), measurement-overhead test (zero
+plumbing allocations on every loadgen thread, global-new override),
+open-loop rate fidelity, workload-seed reproducibility, and the
+stress-regime leadership assertion (16–32 clients + group commit +
+sustained: constant term). Results (i5-1235U, performance governor, ≤82 °C,
+sustained-power state, medians of 3, seeds printed; full tables in
+README): best throughput 82,970 ops/s (16 clients, batch 16, block,
+tmpfs); fsync-bound disk 464 → 3,531 ops/s with batch 8; knee ≈ 20 k/s
+unbatched and ≈ 40–60 k/s batched; headline open-loop at 28 k/s offered:
+e2e p50/p99/p99.9/p99.99 = 283 µs / 967 µs / 8.3 ms / 18.1 ms, commit p50
+170 µs; failover over 60 trials p50/p90/p99 = 276/451/578 ms (bimodal per
+election-timeout theory); ≤10 % sustained loss absorbed with flat tails
+and zero elections; periodic partitions honestly surface as CO-corrected
+p99 ≈ 1.3 s with full recovery between; 30 s stress regime 52,948 ops/s,
+zero elections, term constant; 150+ runs, zero invalid. Findings recorded:
+block beats spin everywhere on this 12-thread host under real client
+load (workload-dependence of the Phase 7 knob), pinning's value is
+variance control, and the U-series sustained-power caveat. Snapshotting
+deferred with evidence (356 MB max log growth). Release, ASan/UBSan, and
+TSan gates all green via `./build_and_test.sh` (10 ctest targets per
+config, incl. the two new bench test binaries).
 
 **Phase 7 addendum — review follow-ups (2026-06-11).** Three changes from
 the phase review, all gated green (Release + ASan/UBSan + TSan, 8/8): (1)

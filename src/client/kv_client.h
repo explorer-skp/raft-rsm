@@ -7,6 +7,7 @@
 
 #include "rpc/messages.h"
 #include "statemachine/kv_store.h"
+#include "transport/frame.h"
 #include "transport/transport.h"
 
 namespace rsm::client {
@@ -75,12 +76,11 @@ public:
 private:
     std::optional<Result> call(const rsm::statemachine::Command& command);
     // One attempt against one server: (re)connect if needed, send, await
-    // the reply. Returns the reply, or nullopt on connect/send/timeout/
-    // decode failure — in which case the connection is closed (correlation
-    // safety; see class comment).
-    std::optional<rsm::rpc::ClientReply> attempt(
-        rsm::rpc::NodeId serverId, const transport::PeerAddress& addr,
-        const rsm::statemachine::Command& command);
+    // the reply. On true, the reply is in decoded_ (a ClientReply); on
+    // false (connect/send/timeout/decode failure) the connection is closed
+    // (correlation safety; see class comment).
+    bool attempt(rsm::rpc::NodeId serverId, const transport::PeerAddress& addr,
+                 const rsm::statemachine::Command& command);
     void dropConnection();
 
     std::vector<std::pair<rsm::rpc::NodeId, transport::PeerAddress>> servers_;
@@ -94,6 +94,18 @@ private:
     rsm::statemachine::Command lastCommand_;  // for resendLast()
     int fd_ = -1;                    // cached connection (clean exchanges only)
     rsm::rpc::NodeId connectedTo_ = 0;
+
+    // Reused hot-path buffers (Phase 8): with these, a steady-state op
+    // performs zero heap allocations on the calling thread — required so the
+    // bench load generators do not perturb the latency they measure
+    // (asserted by the bench allocation test). Capacities stick at their
+    // high-water marks; behavior is identical to fresh objects per call.
+    rsm::statemachine::Command cmdScratch_;            // encode target
+    rsm::rpc::Message reqMsg_{rsm::rpc::ClientRequest{}};  // reused request
+    std::vector<std::uint8_t> frame_;                  // encoded request frame
+    transport::FrameAssembler assembler_;              // reply reassembly
+    rsm::rpc::DecodedMessage decoded_;                 // reply decode target
+    rsm::rpc::DecodePool decodePool_;                  // decode buffer pool
 };
 
 }  // namespace rsm::client

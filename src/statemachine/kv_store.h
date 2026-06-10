@@ -50,6 +50,14 @@ Command encodeKvCommand(std::uint64_t clientId, std::uint64_t seqNo, KvOp op,
                         const std::string& key, const std::string& arg = {},
                         const std::string& arg2 = {});
 
+// Same bytes, written into `out` (cleared first, capacity reused). The
+// allocation-free variant for hot loops (Phase 8 load generators): with a
+// long-lived `out`, steady-state encoding performs zero heap allocations.
+void encodeKvCommandInto(Command& out, std::uint64_t clientId,
+                         std::uint64_t seqNo, KvOp op, const std::string& key,
+                         const std::string& arg = {},
+                         const std::string& arg2 = {});
+
 // The replicated key-value store with the exactly-once session table in its
 // applied state. apply() is deterministic: ordered maps, no clock, no RNG.
 //

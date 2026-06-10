@@ -50,31 +50,36 @@ void KvClient::dropConnection() {
 
 std::optional<KvClient::Result> KvClient::put(const std::string& key,
                                               const std::string& value) {
-    return call(rsm::statemachine::encodeKvCommand(clientId_, ++seqNo_,
-                                                   KvOp::Put, key, value));
+    rsm::statemachine::encodeKvCommandInto(cmdScratch_, clientId_, ++seqNo_,
+                                           KvOp::Put, key, value);
+    return call(cmdScratch_);
 }
 
 std::optional<KvClient::Result> KvClient::get(const std::string& key) {
-    return call(rsm::statemachine::encodeKvCommand(clientId_, ++seqNo_,
-                                                   KvOp::Get, key));
+    rsm::statemachine::encodeKvCommandInto(cmdScratch_, clientId_, ++seqNo_,
+                                           KvOp::Get, key);
+    return call(cmdScratch_);
 }
 
 std::optional<KvClient::Result> KvClient::del(const std::string& key) {
-    return call(rsm::statemachine::encodeKvCommand(clientId_, ++seqNo_,
-                                                   KvOp::Delete, key));
+    rsm::statemachine::encodeKvCommandInto(cmdScratch_, clientId_, ++seqNo_,
+                                           KvOp::Delete, key);
+    return call(cmdScratch_);
 }
 
 std::optional<KvClient::Result> KvClient::cas(const std::string& key,
                                               const std::string& expected,
                                               const std::string& desired) {
-    return call(rsm::statemachine::encodeKvCommand(
-        clientId_, ++seqNo_, KvOp::Cas, key, expected, desired));
+    rsm::statemachine::encodeKvCommandInto(cmdScratch_, clientId_, ++seqNo_,
+                                           KvOp::Cas, key, expected, desired);
+    return call(cmdScratch_);
 }
 
 std::optional<KvClient::Result> KvClient::append(const std::string& key,
                                                  const std::string& suffix) {
-    return call(rsm::statemachine::encodeKvCommand(clientId_, ++seqNo_,
-                                                   KvOp::Append, key, suffix));
+    rsm::statemachine::encodeKvCommandInto(cmdScratch_, clientId_, ++seqNo_,
+                                           KvOp::Append, key, suffix);
+    return call(cmdScratch_);
 }
 
 std::optional<KvClient::Result> KvClient::resendLast() {
@@ -84,7 +89,7 @@ std::optional<KvClient::Result> KvClient::resendLast() {
 }
 
 std::optional<KvClient::Result> KvClient::call(const Command& command) {
-    lastCommand_ = command;
+    if (&command != &lastCommand_) lastCommand_ = command;  // resendLast aliases
     for (int tries = 0; tries < maxAttempts_; ++tries) {
         // Prefer the believed leader; otherwise rotate through the servers.
         std::size_t idx = rotation_ % servers_.size();
@@ -97,7 +102,10 @@ std::optional<KvClient::Result> KvClient::call(const Command& command) {
             }
         }
         const auto& [serverId, addr] = servers_[idx];
-        const auto reply = attempt(serverId, addr, command);
+        const ClientReply* reply =
+            attempt(serverId, addr, command)
+                ? std::get_if<ClientReply>(&decoded_.message)
+                : nullptr;
         if (reply && reply->status == ClientStatus::Ok) {
             if (reply->result.empty()) return Result{};  // defensive
             Result r;
@@ -120,9 +128,9 @@ std::optional<KvClient::Result> KvClient::call(const Command& command) {
     return std::nullopt;
 }
 
-std::optional<ClientReply> KvClient::attempt(NodeId serverId,
-                                             const transport::PeerAddress& addr,
-                                             const Command& command) {
+bool KvClient::attempt(NodeId serverId,
+                       const transport::PeerAddress& addr,
+                       const Command& command) {
     // Reuse the cached connection only if it points at this server and its
     // last exchange completed cleanly (any failure below drops it).
     if (fd_ >= 0 && connectedTo_ != serverId) dropConnection();
@@ -131,86 +139,94 @@ std::optional<ClientReply> KvClient::attempt(NodeId serverId,
         sa.sin_family = AF_INET;
         sa.sin_port = htons(addr.port);
         if (::inet_pton(AF_INET, addr.host.c_str(), &sa.sin_addr) != 1) {
-            return std::nullopt;
+            return false;
         }
         fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd_ < 0) return std::nullopt;
+        if (fd_ < 0) return false;
         if (::connect(fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) <
             0) {
             dropConnection();
-            return std::nullopt;
+            return false;
         }
         const int one = 1;
         ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         connectedTo_ = serverId;
     }
 
-    const Message msg{ClientRequest{clientId_, seqNo_, command}};
-    std::vector<std::uint8_t> frame(transport::kLengthPrefixSize +
-                                    rsm::rpc::encodedSize(msg));
+    // Build the request in the reused message/frame buffers (capacity
+    // sticks across calls; same bytes on the wire as a fresh build).
+    auto& req = std::get<ClientRequest>(reqMsg_);
+    req.clientId = clientId_;
+    req.seqNo = seqNo_;
+    req.command.assign(command.begin(), command.end());
+    frame_.resize(transport::kLengthPrefixSize + rsm::rpc::encodedSize(reqMsg_));
     const std::size_t bodyLen = rsm::rpc::encodeMessage(
-        clientNodeId_, serverId, msg,
-        std::span<std::uint8_t>(frame).subspan(transport::kLengthPrefixSize));
-    if (bodyLen == 0) return std::nullopt;
+        clientNodeId_, serverId, reqMsg_,
+        std::span<std::uint8_t>(frame_).subspan(transport::kLengthPrefixSize));
+    if (bodyLen == 0) return false;
     transport::writeLengthPrefix(static_cast<std::uint32_t>(bodyLen),
-                                 frame.data());
-    for (std::size_t sent = 0; sent < frame.size();) {
-        const ssize_t n = ::send(fd_, frame.data() + sent,
-                                 frame.size() - sent, MSG_NOSIGNAL);
+                                 frame_.data());
+    for (std::size_t sent = 0; sent < frame_.size();) {
+        const ssize_t n = ::send(fd_, frame_.data() + sent,
+                                 frame_.size() - sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
             dropConnection();
-            return std::nullopt;
+            return false;
         }
         sent += static_cast<std::size_t>(n);
     }
 
-    // Await the reply on this connection until the attempt deadline.
-    transport::FrameAssembler assembler;
-    std::optional<ClientReply> result;
+    // Await the reply on this connection until the attempt deadline. The
+    // assembler is reset per attempt (same semantics as a fresh one: bytes
+    // from an earlier exchange never carry over), keeping its capacity.
+    assembler_.reset();
+    bool gotReply = false;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeoutMs_);
-    while (!result) {
+    while (!gotReply) {
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now());
         if (left.count() <= 0) {
             dropConnection();  // a late reply must not leak into the next op
-            return std::nullopt;
+            return false;
         }
         pollfd pfd{fd_, POLLIN, 0};
         const int ready = ::poll(&pfd, 1, static_cast<int>(left.count()));
         if (ready < 0 && errno == EINTR) continue;
         if (ready <= 0) {  // timeout or poll error
             dropConnection();
-            return std::nullopt;
+            return false;
         }
         std::uint8_t buf[64 * 1024];
         const ssize_t n = ::read(fd_, buf, sizeof(buf));
         if (n <= 0) {
             if (n < 0 && errno == EINTR) continue;
             dropConnection();
-            return std::nullopt;  // server closed mid-reply
+            return false;  // server closed mid-reply
         }
         bool bad = false;
-        const bool fed = assembler.feed(
+        const bool fed = assembler_.feed(
             std::span<const std::uint8_t>(buf, static_cast<std::size_t>(n)),
-            [&result, &bad](std::span<const std::uint8_t> body) {
-                const auto decoded = rsm::rpc::decodeMessage(body);
-                if (!decoded) {
+            [this, &gotReply, &bad](std::span<const std::uint8_t> body) {
+                if (gotReply) return;  // keep the reply; ignore trailing frames
+                // Decode into the reused slot (zero steady-state
+                // allocations); identical validation to decodeMessage.
+                if (!rsm::rpc::decodeMessageInto(body, decoded_,
+                                                 decodePool_)) {
                     bad = true;
                     return;
                 }
-                if (const auto* r =
-                        std::get_if<ClientReply>(&decoded->message)) {
-                    result = *r;
+                if (std::get_if<ClientReply>(&decoded_.message) != nullptr) {
+                    gotReply = true;
                 }
             });
         if (!fed || bad) {
             dropConnection();
-            return std::nullopt;
+            return false;
         }
     }
-    return result;
+    return true;
 }
 
 }  // namespace rsm::client

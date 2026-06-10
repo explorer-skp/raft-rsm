@@ -75,6 +75,30 @@ target_compile_options(alloc_tests PRIVATE -Wno-mismatched-new-delete)
 add_test(NAME alloc_tests COMMAND alloc_tests)
 set_tests_properties(alloc_tests PROPERTIES TIMEOUT 120)
 
+# Phase 8: the benchmark harness's own validation suite (stall self-test,
+# rate fidelity, reproducibility, stress-regime leadership stability).
+add_executable(bench_tests
+  test_main.cpp
+  bench_selftest_test.cpp
+)
+target_link_libraries(bench_tests PRIVATE doctest bench_lib)
+
+add_test(NAME bench_tests COMMAND bench_tests)
+set_tests_properties(bench_tests PROPERTIES TIMEOUT 300)
+
+# Phase 8 measurement-overhead test: overrides global operator new (own
+# binary, like alloc_tests) and asserts the load-generator hot loop is
+# allocation-free in steady state.
+add_executable(bench_alloc_tests
+  test_main.cpp
+  bench_alloc_test.cpp
+)
+target_link_libraries(bench_alloc_tests PRIVATE doctest bench_lib)
+target_compile_options(bench_alloc_tests PRIVATE -Wno-mismatched-new-delete)
+
+add_test(NAME bench_alloc_tests COMMAND bench_alloc_tests)
+set_tests_properties(bench_alloc_tests PROPERTIES TIMEOUT 120)
+
 add_executable(faults_tests
   test_main.cpp
   sim_fault_test.cpp

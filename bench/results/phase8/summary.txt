@@ -1,0 +1,101 @@
+PHASE 8 BENCHMARK SUMMARY (medians of repeats; latencies in us)
+host: 12th Gen Intel(R) Core(TM) i5-1235U | 12 cpus | governor=performance no_turbo=0 | Linux 6.19.14-101.fc42.x86_64
+
+Throughput sweeps (committed ops/s)
+-----------------------------------
+config                                        ops/s   e2e p50   e2e p99
+closed.c1.block.b1                            14576        68        94
+closed.c1.spin.b1                             12494        79       112
+closed.c16.block.b1                           24009       680       967
+closed.c16.block.b16                          82970       184       291
+closed.c16.block.b2                           41192       393       614
+closed.c16.block.b32                          43490       352       496
+closed.c16.block.b4                           57399       274       479
+closed.c16.block.b8                           68770       233       328
+closed.c16.spin.b1                            19325       795      1163
+closed.c16.spin.b16                           46877       348       487
+closed.c16.spin.b2                            31479       504       786
+closed.c16.spin.b32                           36178       397       795
+closed.c16.spin.b4                            43841       356       680
+closed.c16.spin.b8                            50940       299       500
+closed.c2.block.b1                            18394       108       154
+closed.c2.spin.b1                             18350       104       217
+closed.c32.block.b1                           23460      1409      1966
+closed.c32.spin.b1                            18657      1737      2458
+closed.c4.block.b1                            21834       174       311
+closed.c4.spin.b1                             19006       207       381
+closed.c8.block.b1                            24437       328       541
+closed.c8.spin.b1                             19912       393       598
+disk.c16.block.b1                               464     30409     62915
+disk.c16.block.b1.fsgroup                       470     32244     53477
+disk.c16.block.b32                             3226      4915      8323
+disk.c16.block.b8                              3531      4522      7471
+pin_ab2.pin0                                  32236       532       696
+pin_ab2.pin1                                  32979       500       999
+
+Open-loop rate sweep (CO-corrected e2e latency)
+-----------------------------------------------
+config                        offered  achieved      p50      p99    p99.9 abandoned
+open.base.rate2000               2000      2000      227      332      606         0
+open.base.rate5000               5000      5000      145      201      492         0
+open.base.rate10000             10000     10000      139      201      664         0
+open.base.rate15000             15000     15000      143      786     2294         0
+open.base.rate20000             20000     20000      283     1688     5505         0
+open.base.rate25000             25000     25000   553648  1744830  1862271         0
+open.base.rate30000             30000     30000  2214593  4362076  4523107         0
+open.base.rate40000             40000     30580  4630512  7516193  8053064     94197
+open.best.rate10000             10000     10000      315      598     1851         0
+open.best.rate20000             20000     20000      279      438     1147         0
+open.best.rate30000             30000     30000      283      418     3998         0
+open.best.rate40000             40000     40000      283      406     4522         0
+open.best.rate50000             50000     50000      315      573    15073         0
+open.best.rate60000             60000     60000      352     1130    18088         0
+open.best.rate70000             70000     70000      451    11010   394265         0
+open.perf.rate5000               5000      5000      381      639     1016         0
+open.perf.rate10000             10000     10000      344      688     3113         0
+open.perf.rate20000             20000     20000      340      573     2163         0
+open.perf.rate30000             30000     30000      356      745     9306         0
+open.perf.rate40000             40000     40000      385     2097    11141         0
+open.perf.rate50000             50000     50000      623    78643   169869         0
+open.perf.rate60000             60000     60000   113246  3590324  3892314         0
+open.perf.rate70000             70000     70000  1509949  5704253  6039798         0
+
+Headline latency (stated offered load; us)
+------------------------------------------
+series                                    p50        p99      p99.9     p99.99        max
+headline.base @14000/s (280001 samples/run)
+  e2e (intended send)                     152        221       2621       8651       9973
+  e2e (actual send)                        95        166       1704       8651       9918
+  commit (leader internal)                 54         96        487       4719       9777
+headline.perf @28000/s (560001 samples/run)
+  e2e (intended send)                     356       1032      16122      23593      24623
+  e2e (actual send)                       307        786       1851      12714      24559
+  commit (leader internal)                199        389        926       7012      24385
+headline.best @28000/s (560001 samples/run)
+  e2e (intended send)                     283        967       8323      18088      19130
+  e2e (actual send)                       231        647       2818       9306      19075
+  commit (leader internal)                170        340       1573       8782      19005
+
+Stress regime (32 clients, batch 8, spin, sustained)
+----------------------------------------------------
+throughput=52948 ops/s  elections_in_window=0  max_term=1  valid=True
+
+Failover (leader kill under load)
+---------------------------------
+n=60  p50=276ms  p99=578ms  max=578ms
+
+Sustained faults (open-loop at fixed offered load)
+--------------------------------------------------
+config                     achieved/s      p50      p99 elections
+fault.closed.clean              23825      664      975         0
+fault.closed.loss1              24117      664      975         0
+fault.closed.loss10             28961      541      819         0
+fault.closed.loss5              26426      598      893         0
+fault.closed.partition          23356      573     1868         5
+fault.open.clean                14000      154      236         0
+fault.open.loss1                14000      147      213         0
+fault.open.loss10               14000      152      240         0
+fault.open.loss5                14000      154      252         0
+fault.open.partition            14000      154  1291846         5
+
+invalid runs: none
