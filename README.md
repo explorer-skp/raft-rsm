@@ -82,10 +82,11 @@ every run; `machine.txt`; `plots/`; `summary.txt`).
   from saved JSON without re-running.
 - **Host control.** Each JSON embeds CPU model, governor, turbo state,
   load average, and hottest-thermal-zone temperature at run start and end.
-  The three Raft threads are pinned to dedicated physical cores (measured:
-  no throughput change, tighter p99.99); everything else floats — on a
-  12-thread host running 12 pipeline threads there are no exclusive cores
-  to hand out, and that is recorded rather than hidden.
+  The three Raft threads are pinned to dedicated physical cores (measured
+  via interleaved A/B: throughput parity; kept as scheduling-variance
+  control on the election-critical thread — DESIGN.md); everything else
+  floats — on a 12-thread host running 12 pipeline threads there are no
+  exclusive cores to hand out, and that is recorded rather than hidden.
 
 **Test bed.** Intel i5-1235U (2 P-cores + 8 E-cores, 12 threads), 7.4 GiB
 RAM, Fedora (Linux 6.19), governor `performance` on all CPUs for every run
@@ -103,36 +104,38 @@ PUT workload, election timeout
 
 **Honest host caveat.** This is a U-series laptop, not a fixed-frequency
 server: under the suite's continuous load the package settles to its
-sustained power limit, and isolated burst runs measure up to ~35 % higher
-than mid-suite cells (33 k vs 24 k ops/s at 16 clients, batch off). All
-reported numbers are from the *sustained* state — mutually comparable and
-conservative. The methodology carries no such caveat; rerun the same
-script on a dedicated box for better absolute numbers.
+sustained power limit, and isolated burst runs on an idle box measure tens
+of percent higher than mid-suite cells (measured during development;
+DESIGN.md). All reported numbers are from the *sustained* state —
+mutually comparable and conservative. The methodology carries no such
+caveat; rerun the same script on a dedicated box for better absolute
+numbers.
 
 ### Throughput (committed ops/s)
 
-Group commit is the dominant knob; blocking waits beat busy-spin on this
-host at every measured operating point (with 16+ client threads sharing 12
-hardware threads, spinning pipeline threads steal the cores the clients
-need — the opposite of the lightly-loaded Phase 7 powersave measurements,
-and exactly the workload-dependence the knob exists to expose).
+Group commit is the dominant knob. The wait-mode knob lands exactly on the
+Phase 7 trade-off: busy-spin wins at low concurrency, where hand-off wake
+latency dominates (1 client: spin 13,891 ops/s at p50 72 µs vs block
+10,001 at 98 µs); blocking wins once many client threads compete with the
+12 pipeline threads for 12 hardware threads (spinning steals the cores the
+clients need), including at the throughput-optimal point.
 
 | 16 clients, tmpfs | batch 1 | batch 4 | batch 8 | batch 16 | batch 32 |
 |---|---|---|---|---|---|
-| block | 24,009 | 57,399 | 68,770 | **82,970** | 43,490 |
-| spin | 19,325 | 43,841 | 50,940 | 46,877 | 36,178 |
+| block | 26,498 | 52,299 | 55,486 | **69,122** | 38,900 |
+| spin | 18,133 | 52,710 | 58,700 | 52,560 | 41,188 |
 
 Batch 32 regresses because 32 > the 16 in-flight requests, so every batch
 waits out the 200 µs linger — the documented batch ≤ concurrency rule.
 
-Concurrency (batch off, block): 1 client → 14,576 (p50 68 µs), 2 → 18,394,
-4 → 21,834, 8 → 24,437, 16 → 24,009, 32 → 23,460 — saturation at ~8
-clients. The single-client point is the honest pipeline-hop cost (~68 µs
-per committed write including fsync on tmpfs).
+Concurrency (batch off, block): 1 client → 10,001, 2 → 15,337, 4 → 21,218,
+8 → 25,208, 16 → 26,498, 32 → 27,112 — a ~26 k plateau from 8 clients up.
+The single-client point is the honest pipeline-hop cost (p50 72 µs spin /
+98 µs block per committed write, fsync on tmpfs included).
 
 **fsync policy (real btrfs NVMe disk, 16 clients):** per-entry fsync
-(batch 1) → 464 ops/s; group commit batch 8 → 3,531 ops/s (7.6×); batch 32
-→ 3,226. The `--fsync every|group` flag at batch 1 measures 464 vs 470
+(batch 1) → 446 ops/s; group commit batch 8 → 3,216 ops/s (7.2×); batch 32
+→ 2,914. The `--fsync every|group` flag at batch 1 measures 446 vs 444
 ops/s — the documented by-construction equivalence; the *real* fsync knob
 is the batch size (one fsync per batch).
 
@@ -146,40 +149,41 @@ enqueued at leader → entry committed, measured on the Raft thread).
 
 | series | p50 | p99 | p99.9 | p99.99 | max |
 |---|---|---|---|---|---|
-| end-to-end (intended send) | 152 | 221 | 2,621 | 8,651 | 9,973 |
-| end-to-end (actual send) | 95 | 166 | 1,704 | 8,651 | 9,918 |
-| commit (leader internal) | 54 | 96 | 487 | 4,719 | 9,777 |
+| end-to-end (intended send) | 211 | 426 | 4,981 | 10,486 | 11,785 |
+| end-to-end (actual send) | 154 | 369 | 2,097 | 10,093 | 11,728 |
+| commit (leader internal) | 76 | 199 | 508 | 5,243 | 11,338 |
 
-**Best config (batch 16 + block), 28,000 req/s offered — 560k samples/run:**
+**Best config (batch 16 + block), 35,000 req/s offered — 700k samples/run:**
 
 | series | p50 | p99 | p99.9 | p99.99 | max |
 |---|---|---|---|---|---|
-| end-to-end (intended send) | 283 | 967 | 8,323 | 18,088 | 19,130 |
-| end-to-end (actual send) | 231 | 647 | 2,818 | 9,306 | 19,075 |
-| commit (leader internal) | 170 | 340 | 1,573 | 8,782 | 19,005 |
+| end-to-end (intended send) | 360 | 655 | 10,486 | 19,923 | 20,556 |
+| end-to-end (actual send) | 307 | 590 | 893 | 10,879 | 20,499 |
+| commit (leader internal) | 182 | 381 | 479 | 5,046 | 20,360 |
 
-(The Phase 7 throughput config, batch 8 + spin at the same 28 k/s, is
-worse on every percentile — p50 356, p99 1,032, p99.9 16,122 — and is in
-the raw data as `headline.perf`.) The intended-vs-actual gap at p99.9+ is
-the coordinated-omission correction doing its job on production data:
-transient backlogs that late dispatch would hide are charged to the
-requests that waited through them. Stated loads are picked from the saved
-sweep by `pick_rate.py` (70 % of the highest rate every repeat sustained
-with p99 ≤ 50 ms and p99.9 ≤ 20 ms).
+(The Phase 7 throughput config, batch 8 + spin, sustains a lower stated
+load — 28 k/s, p50 328 / p99 598 / p99.9 11,928 — and is in the raw data
+as `headline.perf`.) The intended-vs-actual gap at p99.9 — 10,486 µs vs
+893 µs in the best-config table — is the coordinated-omission correction
+doing its job on production data: transient backlogs that late dispatch
+would hide are charged to the requests that waited through them. Stated
+loads are picked from the saved sweep by `pick_rate.py` (70 % of the
+highest rate every repeat sustained with ≥ 99 % rate fidelity, p99 ≤ 50 ms
+and p99.9 ≤ 20 ms).
 
 ### Latency vs throughput
 
 ![latency vs throughput](bench/results/phase8/plots/latency_vs_throughput.png)
 
 The knee, per configuration (10 s windows): **base** (no batching) holds
-p99 ≤ 1.7 ms through 20 k/s and collapses at 25 k/s; **best**
-(batch 16 + block) holds p99 ≤ 1.2 ms through 60 k/s in these windows,
-with the p99.9 tail starting to grow past 40 k/s and a hard wall at
-70 k/s (p99.9 = 394 ms, schedule still fully served). Longer 20 s runs
-show the *sustained* comfortable envelope for the best config is
-~40 k/s — burst windows flatter the knee, which is why the stated-load
-tables above sit at 70 % of the rep-robust sustainable rate, not at the
-cliff edge.
+p99 ≤ 1.4 ms through 20 k/s and collapses at 25 k/s; **best**
+(batch 16 + block) holds **sub-millisecond p50 with p99 ≤ 2.8 ms through
+60 k/s** and hits a hard wall at 70 k/s (p99 = 491 ms, schedule still
+fully served). The p99.9 tail starts growing past 40 k/s, and one 60 k/s
+repeat recorded a 258 ms p99.9 backlog episode — which is exactly why the
+stated-load criterion is rep-robust (every repeat must hold the tail
+bounds) and the headline tables sit at 70 % of the sustainable rate
+(35 k/s), not at the cliff edge.
 
 ![latency percentiles](bench/results/phase8/plots/latency_percentiles.png)
 
@@ -190,10 +194,10 @@ cliff edge.
 60 trials under 8-client load: the current leader is killed at a known
 instant (its restart between trials replays from disk — the Phase 4 path);
 a probe client with 100 ms attempts measures time to the *next committed
-write*, leader discovery included. **p50 = 276 ms, p90 = 451 ms,
-p99 = max = 578 ms.** The distribution is bimodal exactly as Raft predicts
+write*, leader discovery included. **p50 = p90 = 277 ms,
+p99 = max = 629 ms.** The distribution is bimodal exactly as Raft predicts
 with a 150–300 ms randomized election timeout: the main mass is one
-election timeout plus a round trip; the 400–580 ms cluster is trials where
+election timeout plus a round trip; the 400–630 ms cluster is trials where
 the first candidate lost the race (split vote / stale-log candidate) and a
 second timeout fired. This is why failover is reported as a distribution,
 never a single number — and why these *intentional* kills are distinct
@@ -203,38 +207,49 @@ from clean-load elections, which the harness treats as bugs.
 
 ![faults](bench/results/phase8/plots/faults.png)
 
-Open-loop at a fixed 14 k req/s offered load (fault cells run with the
-same repeats-and-medians discipline as the sweeps):
+Faults are measured **open-loop at a fixed offered load** — that is the
+only honest way to measure a system under faults, because the load does
+not politely back off when the cluster degrades. 14 k req/s offered,
+medians of 3:
 
 | condition | achieved/s | p50 µs | p99 µs | elections |
 |---|---|---|---|---|
-| clean | 14,000 | 154 | 236 | 0 |
-| 1 % message loss | 14,000 | 147 | 213 | 0 |
-| 5 % loss | 14,000 | 154 | 252 | 0 |
-| 10 % loss | 14,000 | 152 | 240 | 0 |
-| partition 1 s every 5 s | 14,000 | 154 | 1,291,846 | 5 |
+| clean | 14,000 | 209 | 418 | 0 |
+| 1 % message loss | 14,000 | 209 | 414 | 0 |
+| 5 % loss | 14,000 | 211 | 393 | 0 |
+| 10 % loss | 14,000 | 211 | 381 | 0 |
+| partition 1 s every 5 s | 14,000 | 217 | 1,308,623 | 5 |
 
-Sustained symmetric message loss up to 10 % is absorbed with no measurable
-degradation at this load (loopback RTTs make retransmission cheap; commit
-needs one of two followers per entry, heartbeats re-drive the rest) and no
-leadership instability. Periodic partitions behave exactly as the protocol
-says they must: while the leader is isolated (~1 s + election) nothing
-commits, and the CO-corrected p99 honestly charges those outages to the
-requests scheduled during them — the p50 shows full recovery between
-partitions, and the offered rate is still served. Closed-loop variants
-(`fault.closed.*` in the raw data) hold their throughput across all loss
-rates with zero elections — no measurable degradation at these loss rates
-on loopback.
+Sustained symmetric message loss up to 10 % is absorbed at this load with
+the offered rate fully served, the tail essentially unmoved, and zero
+elections (loopback RTTs make retransmission cheap; commit needs one of
+two followers per entry, heartbeats re-drive the rest). Periodic
+partitions read exactly as the protocol dictates, by design: isolating the
+leader stops commits for ~1 s of partition plus an election, the five
+elections in the window are the expected majority-side re-elections (one
+per leader isolation), and the CO-corrected p99 of ~1.3 s honestly charges
+each outage to the requests scheduled during it — while the p50 of 217 µs
+shows full recovery between partitions and the offered rate is still
+served in aggregate.
+
+Closed-loop fault runs exist in the raw data (`fault.closed.*`) but
+**closed-loop throughput-under-loss is not a meaningful metric and is not
+presented as a finding**: on an oversubscribed host, dropping inter-node
+messages frees contended CPU that the closed-loop clients immediately
+convert into more requests, so measured throughput can *rise* with loss
+(it does here: 26.1 k clean → 30.5 k at 10 % loss). That artifact is
+precisely why the fault story above is open-loop — the offered load must
+be independent of the system's condition.
 
 **Stress regime** (the Phase 7 lesson, now a standing benchmark gate):
 32 clients + group commit (batch 8, spin) + 30 s sustained =
-**52,948 ops/s with zero elections and the term constant** — 1.59 M
-committed entries, 356 MB of logs, no compaction needed (the snapshotting
+**75,140 ops/s with zero elections and the term constant** — 2.25 M
+committed entries, 500 MB of logs, no compaction needed (the snapshotting
 deferral evidence, recorded as `data_bytes` in every run).
 
 Leadership stability held across the entire suite: **zero invalid runs in
-150+** — no clean-load run ever recorded an election inside its
-measurement window.
+194** — no clean-load run ever recorded an election inside its measurement
+window.
 
 ### Plots
 

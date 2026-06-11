@@ -4,98 +4,98 @@ host: 12th Gen Intel(R) Core(TM) i5-1235U | 12 cpus | governor=performance no_tu
 Throughput sweeps (committed ops/s)
 -----------------------------------
 config                                        ops/s   e2e p50   e2e p99
-closed.c1.block.b1                            14576        68        94
-closed.c1.spin.b1                             12494        79       112
-closed.c16.block.b1                           24009       680       967
-closed.c16.block.b16                          82970       184       291
-closed.c16.block.b2                           41192       393       614
-closed.c16.block.b32                          43490       352       496
-closed.c16.block.b4                           57399       274       479
-closed.c16.block.b8                           68770       233       328
-closed.c16.spin.b1                            19325       795      1163
-closed.c16.spin.b16                           46877       348       487
-closed.c16.spin.b2                            31479       504       786
-closed.c16.spin.b32                           36178       397       795
-closed.c16.spin.b4                            43841       356       680
-closed.c16.spin.b8                            50940       299       500
-closed.c2.block.b1                            18394       108       154
-closed.c2.spin.b1                             18350       104       217
-closed.c32.block.b1                           23460      1409      1966
-closed.c32.spin.b1                            18657      1737      2458
-closed.c4.block.b1                            21834       174       311
-closed.c4.spin.b1                             19006       207       381
-closed.c8.block.b1                            24437       328       541
-closed.c8.spin.b1                             19912       393       598
-disk.c16.block.b1                               464     30409     62915
-disk.c16.block.b1.fsgroup                       470     32244     53477
-disk.c16.block.b32                             3226      4915      8323
-disk.c16.block.b8                              3531      4522      7471
-pin_ab2.pin0                                  32236       532       696
-pin_ab2.pin1                                  32979       500       999
+closed.c1.block.b1                            10001        98       190
+closed.c1.spin.b1                             13891        72        89
+closed.c16.block.b1                           26498       573       958
+closed.c16.block.b16                          69122       217       365
+closed.c16.block.b2                           41111       377       655
+closed.c16.block.b32                          38900       389       606
+closed.c16.block.b4                           52299       299       557
+closed.c16.block.b8                           55486       291       360
+closed.c16.spin.b1                            18133       893      1130
+closed.c16.spin.b16                           52560       307       459
+closed.c16.spin.b2                            37309       426       664
+closed.c16.spin.b32                           41188       377       639
+closed.c16.spin.b4                            52710       295       520
+closed.c16.spin.b8                            58700       262       430
+closed.c2.block.b1                            15337       127       197
+closed.c2.spin.b1                             21665        90       164
+closed.c32.block.b1                           27112      1098      1769
+closed.c32.spin.b1                            17765      1835      2392
+closed.c4.block.b1                            21218       180       332
+closed.c4.spin.b1                             18984       209       344
+closed.c8.block.b1                            25208       332       565
+closed.c8.spin.b1                             18794       422       582
+disk.c16.block.b1                               446     34079     60817
+disk.c16.block.b1.fsgroup                       444     34603     52429
+disk.c16.block.b32                             2914      5243      8782
+disk.c16.block.b8                              3216      4653      8520
+pin_ab2.pin0                                  25454       688      1065
+pin_ab2.pin1                                  25124       623      1212
 
 Open-loop rate sweep (CO-corrected e2e latency)
 -----------------------------------------------
 config                        offered  achieved      p50      p99    p99.9 abandoned
-open.base.rate2000               2000      2000      227      332      606         0
-open.base.rate5000               5000      5000      145      201      492         0
-open.base.rate10000             10000     10000      139      201      664         0
-open.base.rate15000             15000     15000      143      786     2294         0
-open.base.rate20000             20000     20000      283     1688     5505         0
-open.base.rate25000             25000     25000   553648  1744830  1862271         0
-open.base.rate30000             30000     30000  2214593  4362076  4523107         0
-open.base.rate40000             40000     30580  4630512  7516193  8053064     94197
-open.best.rate10000             10000     10000      315      598     1851         0
-open.best.rate20000             20000     20000      279      438     1147         0
-open.best.rate30000             30000     30000      283      418     3998         0
-open.best.rate40000             40000     40000      283      406     4522         0
-open.best.rate50000             50000     50000      315      573    15073         0
-open.best.rate60000             60000     60000      352     1130    18088         0
-open.best.rate70000             70000     70000      451    11010   394265         0
-open.perf.rate5000               5000      5000      381      639     1016         0
-open.perf.rate10000             10000     10000      344      688     3113         0
-open.perf.rate20000             20000     20000      340      573     2163         0
-open.perf.rate30000             30000     30000      356      745     9306         0
-open.perf.rate40000             40000     40000      385     2097    11141         0
-open.perf.rate50000             50000     50000      623    78643   169869         0
-open.perf.rate60000             60000     60000   113246  3590324  3892314         0
-open.perf.rate70000             70000     70000  1509949  5704253  6039798         0
+open.base.rate2000               2000      2000      236      381      557         0
+open.base.rate5000               5000      5000      182      307      623         0
+open.base.rate10000             10000     10000      180      274      680         0
+open.base.rate15000             15000     15000      215      508     3441         0
+open.base.rate20000             20000     20000      295     1409     4784         0
+open.base.rate25000             25000     25000    16122    60293   385876         0
+open.base.rate30000             30000     30000   973079  2382365  2516582         0
+open.base.rate40000             40000     35065  3825205  6509560  6899152     49349
+open.best.rate10000             10000     10000      344      532      713         0
+open.best.rate20000             20000     20000      336      500     1655         0
+open.best.rate30000             30000     30000      344      582     5833         0
+open.best.rate40000             40000     40000      369      713     6095         0
+open.best.rate50000             50000     50000      418     1098    18088         0
+open.best.rate60000             60000     60000      508     2785    17826         0
+open.best.rate70000             70000     70000     1442   490734   603980         0
+open.perf.rate5000               5000      5000      360      598      819         0
+open.perf.rate10000             10000     10000      356      573      786         0
+open.perf.rate20000             20000     20000      332      549     1802         0
+open.perf.rate30000             30000     30000      319      582     6619         0
+open.perf.rate40000             40000     40000      311      672     7602         0
+open.perf.rate50000             50000     50000      328     1622    20972         0
+open.perf.rate60000             60000     60000      344    26739   536871         0
+open.perf.rate70000             70000     70000   281018  3087008  3456106         0
 
 Headline latency (stated offered load; us)
 ------------------------------------------
 series                                    p50        p99      p99.9     p99.99        max
 headline.base @14000/s (280001 samples/run)
-  e2e (intended send)                     152        221       2621       8651       9973
-  e2e (actual send)                        95        166       1704       8651       9918
-  commit (leader internal)                 54         96        487       4719       9777
+  e2e (intended send)                     211        426       4981      10486      11785
+  e2e (actual send)                       154        369       2097      10093      11728
+  commit (leader internal)                 76        199        508       5243      11338
 headline.perf @28000/s (560001 samples/run)
-  e2e (intended send)                     356       1032      16122      23593      24623
-  e2e (actual send)                       307        786       1851      12714      24559
-  commit (leader internal)                199        389        926       7012      24385
-headline.best @28000/s (560001 samples/run)
-  e2e (intended send)                     283        967       8323      18088      19130
-  e2e (actual send)                       231        647       2818       9306      19075
-  commit (leader internal)                170        340       1573       8782      19005
+  e2e (intended send)                     328        598      11928      22807      23749
+  e2e (actual send)                       279        524        934      12452      23694
+  commit (leader internal)                184        332        504       6816      23401
+headline.best @35000/s (700000 samples/run)
+  e2e (intended send)                     360        655      10486      19923      20556
+  e2e (actual send)                       307        590        893      10879      20499
+  commit (leader internal)                182        381        479       5046      20360
 
 Stress regime (32 clients, batch 8, spin, sustained)
 ----------------------------------------------------
-throughput=52948 ops/s  elections_in_window=0  max_term=1  valid=True
+throughput=75140 ops/s  elections_in_window=0  max_term=1  valid=True
 
 Failover (leader kill under load)
 ---------------------------------
-n=60  p50=276ms  p99=578ms  max=578ms
+n=60  p50=277ms  p99=629ms  max=629ms
 
 Sustained faults (open-loop at fixed offered load)
 --------------------------------------------------
 config                     achieved/s      p50      p99 elections
-fault.closed.clean              23825      664      975         0
-fault.closed.loss1              24117      664      975         0
-fault.closed.loss10             28961      541      819         0
-fault.closed.loss5              26426      598      893         0
-fault.closed.partition          23356      573     1868         5
-fault.open.clean                14000      154      236         0
-fault.open.loss1                14000      147      213         0
-fault.open.loss10               14000      152      240         0
-fault.open.loss5                14000      154      252         0
-fault.open.partition            14000      154  1291846         5
+fault.closed.clean              26127      598      967         0
+fault.closed.loss1              26787      565      950         0
+fault.closed.loss10             30471      500      819         0
+fault.closed.loss5              28560      532      893         0
+fault.closed.partition          22088      573     2081         5
+fault.open.clean                14000      209      418         0
+fault.open.loss1                14000      209      414         0
+fault.open.loss10               14000      211      381         0
+fault.open.loss5                14000      211      393         0
+fault.open.partition            14000      217  1308623         5
 
 invalid runs: none

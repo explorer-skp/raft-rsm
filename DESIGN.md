@@ -1006,6 +1006,8 @@ within noise (33.0 k/s pinned vs 32.2 k/s unpinned at 16 clients), but the
 unpinned runs show occasional large negative excursions (one rep at
 22.1 k/s, −33 %) that the pinned runs do not — pinning's measured value is
 VARIANCE control on the election-critical thread, not a mean shift.
+The canonical governored dataset agrees: its interleaved `pin_ab2` cells
+measure 25.1 k/s pinned vs 25.5 k/s unpinned (parity within noise).
 Pinned is the recorded default for all reported numbers.
 
 **Host caveat discovered during the run (recorded with the results):**
@@ -1279,9 +1281,11 @@ e2e p50/p99/p99.9/p99.99 = 283 µs / 967 µs / 8.3 ms / 18.1 ms, commit p50
 election-timeout theory); ≤10 % sustained loss absorbed with flat tails
 and zero elections; periodic partitions honestly surface as CO-corrected
 p99 ≈ 1.3 s with full recovery between; 30 s stress regime 52,948 ops/s,
-zero elections, term constant; 150+ runs, zero invalid. Findings recorded:
-block beats spin everywhere on this 12-thread host under real client
-load (workload-dependence of the Phase 7 knob), pinning's value is
+zero elections, term constant; 150+ runs, zero invalid. *(Development-run
+figures; superseded by the canonical dataset note below — same shapes,
+same conclusions, refreshed magnitudes.)* Findings recorded: the
+wait-mode trade-off is operating-point-dependent on this 12-thread host
+(see the canonical-dataset note for the final form), pinning's value is
 variance control, and the U-series sustained-power caveat. Snapshotting
 deferred with evidence (356 MB max log growth). Release, ASan/UBSan, and
 TSan gates all green via `./build_and_test.sh` (10 ctest targets per
@@ -1319,6 +1323,39 @@ RTT excluded (additive). (6) Gate re-verified green on all three configs
 unchanged. The governored clean benchmark re-run that will stamp the
 committed git rev into the recorded data is deliberately left to the
 operator, per instruction.
+
+**Phase 8 canonical dataset (2026-06-12).** The operator's single
+uninterrupted `run_benchmarks.sh` invocation at rev `1db3b19` (governor
+`performance`, recorded in `machine.txt` and every per-run JSON) is the
+canonical result set behind the README; it supersedes the development-run
+magnitudes quoted in the phase note above. 194 runs, **zero invalid**.
+Canonical headlines: best throughput 69,122 ops/s (16 clients, batch 16,
+block, tmpfs); single-client p50 72 µs (spin) / 98 µs (block); disk 446 →
+3,216 ops/s with batch 8 (7.2×; fsync=group at batch 1 measures 444 ≈ 446,
+the equivalence shown); best-config open-loop holds sub-ms p50 with p99 ≤
+2.8 ms through 60 k/s, wall at 70 k/s; stated-load tables at 14 k/s (base:
+e2e p50/p99 = 211/426 µs, commit 76/199 µs) and 35 k/s (best: e2e
+360/655 µs, commit 182/381 µs, p99.9 10.5 ms intended vs 0.9 ms actual —
+the CO gap on production data); stress regime 75,140 ops/s over 30 s,
+2.25 M entries, 500 MB logs, zero elections; failover p50 = p90 = 277 ms,
+p99 = max = 629 ms over 60 trials; ≤10 % loss: rate served, tail flat
+(p99 418 → 381 µs), zero elections; periodic partitions: CO-corrected p99
+≈ 1.31 s, p50 217 µs, the expected 5 majority-side re-elections. Two
+corrections made while syncing the README to this dataset: (1) ten stale
+single-run `fault.*.json` files from the development dataset had survived
+into the results directory and were polluting the regenerated fault
+medians (the labels matched, so `plot_results.py` merged them) — deleted,
+summary regenerated from canonical data only; (2) the development-run
+finding "block beats spin everywhere" did NOT replicate — the canonical
+data lands on the Phase 7 trade-off as originally documented (spin wins at
+1–2 clients where wake latency dominates: 13.9 k vs 10.0 k ops/s at one
+client; block wins at the throughput-optimal point: batch 16 at 69.1 k vs
+52.6 k) — README and the findings line above corrected accordingly. The
+closed-loop fault cells measure throughput RISING with loss (26.1 k clean
+→ 30.5 k at 10 %): a closed-loop-under-faults artifact (dropped cluster
+traffic frees contended CPU that self-throttled clients consume), now
+explicitly framed in the README as the reason faults are measured
+open-loop, not as a finding.
 
 **Phase 7 addendum — review follow-ups (2026-06-11).** Three changes from
 the phase review, all gated green (Release + ASan/UBSan + TSan, 8/8): (1)
