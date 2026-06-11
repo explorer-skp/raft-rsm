@@ -91,9 +91,13 @@ every run; `machine.txt`; `plots/`; `summary.txt`).
 RAM, Fedora (Linux 6.19), governor `performance` on all CPUs for every run
 (asserted from the per-run machine records), turbo on, otherwise idle, max
 thermal-zone temperature 82 °C across the suite. 3-node cluster over
-loopback TCP, one process (equivalent contention to the spec's
-3-processes-on-one-host topology — same threads, same cores, same sockets;
-see DESIGN.md). 16-byte values, 64-key PUT workload, election timeout
+loopback TCP, one process **by design** (equivalent contention to the
+spec's 3-processes-on-one-host topology — same threads, same cores, same
+sockets; see DESIGN.md): real network RTT is excluded and would add a
+roughly constant term. The cross-process wiring is validated separately —
+a real three-`raft_node`-process cluster serving `kv_cli` ops is on record
+at `bench/results/phase8/three_process_smoke.txt`. 16-byte values, 64-key
+PUT workload, election timeout
 150–300 ms, heartbeat 50 ms. Raft threads pinned (one per physical core);
 3 repeats per sweep cell, medians reported, seeds 1–3.
 
@@ -199,7 +203,8 @@ from clean-load elections, which the harness treats as bugs.
 
 ![faults](bench/results/phase8/plots/faults.png)
 
-Open-loop at a fixed 14 k req/s offered load (single runs):
+Open-loop at a fixed 14 k req/s offered load (fault cells run with the
+same repeats-and-medians discipline as the sweeps):
 
 | condition | achieved/s | p50 µs | p99 µs | elections |
 |---|---|---|---|---|
@@ -217,9 +222,9 @@ says they must: while the leader is isolated (~1 s + election) nothing
 commits, and the CO-corrected p99 honestly charges those outages to the
 requests scheduled during them — the p50 shows full recovery between
 partitions, and the offered rate is still served. Closed-loop variants
-(`fault.closed.*` in the raw data) hold 23–29 k ops/s across all loss
-rates — within the host's sustained-power variance band for single runs;
-the signal is the absence of degradation, not the ±20 % spread.
+(`fault.closed.*` in the raw data) hold their throughput across all loss
+rates with zero elections — no measurable degradation at these loss rates
+on loopback.
 
 **Stress regime** (the Phase 7 lesson, now a standing benchmark gate):
 32 clients + group commit (batch 8, spin) + 30 s sustained =

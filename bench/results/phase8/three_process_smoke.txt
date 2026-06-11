@@ -1,0 +1,35 @@
+# Three-process cluster smoke test — 2026-06-11T23:59:45+05:30
+# git: 8b74e565620b2121034fa79eebc80242e10283e5
+# One raft_node process per node (real cross-process loopback TCP),
+# durable data dirs, default knobs; kv_cli is a fourth process per op.
+
+$ cat peers.conf
+1 127.0.0.1 5101
+2 127.0.0.1 5102
+3 127.0.0.1 5103
+
+started raft_node --id 1 (pid 38690)
+started raft_node --id 2 (pid 38692)
+started raft_node --id 3 (pid 38694)
+$ kv_cli put greeting hello-from-3-processes
+OK
+$ kv_cli get greeting
+OK hello-from-3-processes
+$ kv_cli append greeting !!
+OK hello-from-3-processes!!
+$ kv_cli get greeting
+OK hello-from-3-processes!!
+$ kv_cli cas greeting hello-from-3-processes!! replaced
+OK
+$ kv_cli get greeting
+OK replaced
+$ kv_cli del greeting
+OK
+$ kv_cli get greeting
+NOT_FOUND
+
+# leader election trace (from the three node logs):
+[raft] node=1 term=1 role=Candidate event=election-started
+[raft] node=1 term=1 role=Leader event=won-election
+
+# all three node processes terminated by the harness after the run

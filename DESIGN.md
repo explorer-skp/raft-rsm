@@ -873,7 +873,13 @@ contention picture (total threads, cores, loopback sockets) is identical;
 the pipeline is allocation-free so there is no hidden allocator sharing;
 and in-process is what lets every instrument below attach through existing
 seams instead of adding control RPCs to `raft_node`. Recorded as a
-methodology caveat in the README.
+methodology caveat in the README. The cross-process wiring itself is
+separately validated and on record: a real three-`raft_node`-process
+cluster (plus `kv_cli` as a fourth process per op) elects a leader and
+serves put/get/append/cas/del with correct semantics —
+`bench/results/phase8/three_process_smoke.txt`. The headline numbers are
+in-process **by design**; a real network would add an RTT-shaped, roughly
+additive term on top of them, not change the comparisons between cells.
 
 ### Load generation (decision: fixed-rate open-loop + closed-loop)
 
@@ -909,6 +915,27 @@ asserts the intended-time tail reports it while the actual-time tail hides
 it. Measured: intended p99 = 469.8 ms / p99.9 = 499.1 ms vs actual p99 =
 1.9 ms — a ~250× gap that IS coordinated omission, demonstrated and pinned.
 
+### Histogram decision: in-repo HDR-style, not HdrHistogram_c
+
+The latency instrument is the project's own `metrics::LatencyHistogram`
+(Phase 7): an HDR-style log-linear histogram — 64 linear sub-buckets per
+power-of-two magnitude, so worst-case quantization is 1/64 ≈ 1.6 % of the
+recorded value — with fixed storage, O(1) allocation-free recording, and
+lock-free per-thread instances merged after the run. The spec's allowed
+dependency `HdrHistogram_c` was deliberately NOT vendored: its two
+advantages are finer precision and the built-in expected-interval
+coordinated-omission API, and this harness needs neither. Precision: 1.6 %
+quantization is more than an order of magnitude below the run-to-run
+variance of every reported number (sweep cells vary several percent across
+repeats at p50 and tens of percent at p99.9 — see the medians-of-3
+discipline), so library precision would be false precision. CO handling:
+the correction lives in the measurement layer — latency is computed from
+the intended send time before it ever reaches a histogram — so the
+recording API needs no CO awareness, and the stall self-test validates the
+correction end to end. Anywhere these documents say "HDR" or
+"HdrHistogram-style", they mean this in-repo implementation; no external
+histogram library is linked.
+
 ### Measurement path: allocation- and lock-free in steady state
 
 The Phase 7 discipline extended to the observer: the generator hot loop
@@ -942,9 +969,10 @@ into the JSON, exits 3, and `run_benchmarks.sh` aborts, because an
 unexpected election is a bug to investigate (the Phase 7 lesson), not
 noise. The stress regime that exposed the apply-backpressure bug (high
 concurrency + group commit + sustained duration) is explicitly in the
-suite: a 30 s, 32-client, batch-8, busy-spin clean run must hold one
-constant term, plus a shortened ctest variant (`bench_tests`) as the
-permanent regression net.
+suite: the 30 s, 32-client, batch-8, busy-spin clean run is the headline
+leadership-stability fact — measured 52,948 ops/s with ~1.59 M committed
+entries and ZERO elections, term constant — plus a shortened ctest variant
+(`bench_tests`, 8 s/16 clients) as the permanent regression net.
 
 ### Fault instruments
 
@@ -969,7 +997,11 @@ service-hook wrapper on first call — again no runtime changes. Everything
 else floats. Measured honestly: the suite's first-cell `pin_ab` pair is
 ORDER-CONFOUNDED (it runs before the package settles to its sustained
 power limit — see host caveat below) and is superseded by an interleaved
-warm-machine A/B (`pin_ab2.*`, 3× alternating): median throughput equal
+warm-machine A/B (`pin_ab2.*`, 3× alternating). For the record: the
+interleaved-redo applies to THIS pin-vs-no-pin comparison only; the
+spin-vs-block conclusion was never a sequential A/B — it comes from sweep
+cells that all ran in the same sustained regime, three repeats each.
+The pin A/B result: median throughput equal
 within noise (33.0 k/s pinned vs 32.2 k/s unpinned at 16 clients), but the
 unpinned runs show occasional large negative excursions (one rep at
 22.1 k/s, −33 %) that the pinned runs do not — pinning's measured value is
@@ -1005,9 +1037,21 @@ machine-start/end blocks inside each JSON: CPU model, governor, no_turbo,
 kernel, loadavg, hottest thermal zone), builds Release, runs the full
 matrix (REPEATS× per cell, seeds printed, medians reported), writes one
 raw JSON per run, picks the headline offered load from the saved sweep
-itself (`pick_rate.py`: 70 % of the highest cleanly-sustained rate), and
-renders all plots + `summary.txt` from the saved files via
+itself, and renders all plots + `summary.txt` from the saved files via
 `plot_results.py` (matplotlib — tooling, not part of the C++ deliverable).
+
+**Stated-load criterion (`pick_rate.py`, final form):** sustainable = the
+highest swept rate where EVERY repeat (a) stayed valid, (b) abandoned
+nothing, (c) achieved ≥ 99 % of the offered send rate and committed ≥ 99 %
+of it, (d) held CO-corrected e2e p99 ≤ 50 ms, and (e) held p99.9 ≤ 20 ms;
+the headline load is 70 % of that. Clauses (d) and (e) were added
+iteratively after the data showed why rate fidelity alone is not enough: a
+bounded-in-flight generator can keep serving the offered rate while
+per-request queueing grows toward seconds (the 20 k/s base point passed
+(a)–(c) with a 3.6 s p99), and a p99 bound alone admitted a rate whose
+20-second sustained run grew a 90 ms p99.9 (transient backlogs at
+power-limited clocks). Both missteps are visible in the recorded sweep
+data; the criterion that survived them is the one stated here.
 Per-run workload determinism (same seed ⇒ same key sequence) is
 unit-tested; open-loop rate fidelity (the generator holds the offered rate
 within tolerance when the system keeps up) is asserted in `bench_tests`.
@@ -1242,6 +1286,39 @@ variance control, and the U-series sustained-power caveat. Snapshotting
 deferred with evidence (356 MB max log growth). Release, ASan/UBSan, and
 TSan gates all green via `./build_and_test.sh` (10 ctest targets per
 config, incl. the two new bench test binaries).
+
+**Phase 8 closeout — audit items resolved (2026-06-12).** Every item from
+the post-gate self-audit, production code frozen (only `/bench`, `/test`,
+docs, and the run script touched — and this round touched no C++ at all):
+(1) the histogram deviation is now an explicit DESIGN decision ("Histogram
+decision" section): in-repo HDR-style log-linear histogram (~1.6 %
+quantization, allocation-free, mergeable) instead of vendoring
+`HdrHistogram_c`, CO correction in the measurement layer, quantization an
+order of magnitude below run-to-run variance; no wording anywhere claims
+the C library. (2) Accuracy fixes: the interleaved-redo is documented as
+the pin-vs-no-pin A/B specifically (spin-vs-block was sweep-cell-based,
+never sequential); the 30 s stress run (52,948 ops/s, ~1.59 M entries,
+0 elections, term constant) is cited as the headline stability fact over
+the short ctest variant; the final `pick_rate.py` criterion (validity +
+nothing abandoned + ≥99 % rate fidelity and commit rate + p99 ≤ 50 ms +
+p99.9 ≤ 20 ms, headline = 70 %) is documented WITH the two recorded
+missteps that motivated each tail bound. (3) `run_benchmarks.sh` is fully
+self-contained: the best-config open sweep + `headline.best` cells and the
+interleaved `pin_ab2` A/B (canonical seeds `SEED..SEED+REPEATS-1`) are in
+the script, so one uninterrupted invocation regenerates the entire set.
+(4) Fault loss/partition cells (and their clean references) upgraded from
+single runs to the same 3-repeat/median discipline as the sweeps; README
+fault section reworded accordingly (the single-run ±20 % artifact
+explanation is gone because the artifact's cause is). (5) Cross-process
+wiring validated for the record: a real three-`raft_node`-process cluster
++ `kv_cli` ops (put/get/append/cas/del, leader election trace) captured in
+`bench/results/phase8/three_process_smoke.txt`; DESIGN + README state
+plainly that the benchmark numbers are in-process by design with network
+RTT excluded (additive). (6) Gate re-verified green on all three configs
+(Release, ASan/UBSan, TSan; 10/10 ctest targets each), Phase 6 chaos suite
+unchanged. The governored clean benchmark re-run that will stamp the
+committed git rev into the recorded data is deliberately left to the
+operator, per instruction.
 
 **Phase 7 addendum — review follow-ups (2026-06-11).** Three changes from
 the phase review, all gated green (Release + ASan/UBSan + TSan, 8/8): (1)

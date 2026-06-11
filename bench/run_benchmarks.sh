@@ -71,7 +71,8 @@ run() {
                  --out "$OUT/$name.r$r.json"
     done
 }
-# run1 NAME [args...] — single run (stress, failover, faults).
+# run1 NAME [args...] — single run (stress: one long assertion run;
+# failover: 60 trials inside one run are already a distribution).
 run1() {
     local name="$1"; shift
     echo "== $name =="
@@ -148,9 +149,11 @@ for rate in 10000 20000 30000 40000 50000 60000 70000; do
 done
 
 # ---------- 5. headline latency tables at a stated offered load -----------
-# The stated load is ~70% of the highest rate the curve sustained cleanly
-# (achieved >= 99% of offered, nothing abandoned); pick_rate.py reads the
-# saved sweep so the choice itself is reproducible from the raw data.
+# The stated load is 70% of the highest rate EVERY repeat sustained cleanly
+# (valid, nothing abandoned, achieved+committed >= 99% of offered, p99 <=
+# 50ms, p99.9 <= 20ms — full criterion + its history in DESIGN.md);
+# pick_rate.py reads the saved sweep so the choice itself is reproducible
+# from the raw data.
 HEADLINE_BASE=$(python3 bench/pick_rate.py "$OUT" open.base)
 HEADLINE_PERF=$(python3 bench/pick_rate.py "$OUT" open.perf)
 HEADLINE_BEST=$(python3 bench/pick_rate.py "$OUT" open.best)
@@ -177,24 +180,27 @@ run1 "failover" --mode failover --trials "$TRIALS" --threads 8 \
     --warmup 2 $PIN
 
 # ---------- 8. sustained faults vs clean baseline -------------------------
+# Same repeats-and-medians discipline as the sweeps: single fault runs sat
+# inside the host's sustained-power variance band and produced artifacts
+# (a 10%-loss cell once measured ABOVE its clean reference).
 FAULT_RATE=$HEADLINE_BASE
 for loss in 1 5 10; do
-    run1 "fault.open.loss$loss" --mode open --rate "$FAULT_RATE" \
+    run "fault.open.loss$loss" --mode open --rate "$FAULT_RATE" \
         --threads "$OPEN_THREADS" --seconds 15 --warmup "$WARMUP" \
         --loss-pct "$loss" $PIN
-    run1 "fault.closed.loss$loss" --mode closed --threads 16 \
+    run "fault.closed.loss$loss" --mode closed --threads 16 \
         --seconds 15 --warmup "$WARMUP" --loss-pct "$loss" $PIN
 done
-run1 "fault.open.partition" --mode open --rate "$FAULT_RATE" \
+run "fault.open.partition" --mode open --rate "$FAULT_RATE" \
     --threads "$OPEN_THREADS" --seconds 30 --warmup "$WARMUP" \
     --partition-period-ms 5000 --partition-len-ms 1000 $PIN
-run1 "fault.closed.partition" --mode closed --threads 16 --seconds 30 \
+run "fault.closed.partition" --mode closed --threads 16 --seconds 30 \
     --warmup "$WARMUP" --partition-period-ms 5000 --partition-len-ms 1000 \
     $PIN
 # Clean references at the same windows for honest comparison.
-run1 "fault.open.clean" --mode open --rate "$FAULT_RATE" \
+run "fault.open.clean" --mode open --rate "$FAULT_RATE" \
     --threads "$OPEN_THREADS" --seconds 15 --warmup "$WARMUP" $PIN
-run1 "fault.closed.clean" --mode closed --threads 16 --seconds 15 \
+run "fault.closed.clean" --mode closed --threads 16 --seconds 15 \
     --warmup "$WARMUP" $PIN
 
 # ---------- plots + summary -------------------------------------------------
