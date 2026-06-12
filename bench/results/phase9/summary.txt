@@ -1,44 +1,44 @@
 PHASE 8 BENCHMARK SUMMARY (medians of repeats; latencies in us)
-host: 12th Gen Intel(R) Core(TM) i5-1235U | 12 cpus | governor=powersave no_turbo=0 | Linux 6.19.14-101.fc42.x86_64
+host: 12th Gen Intel(R) Core(TM) i5-1235U | 12 cpus | governor=performance no_turbo=0 | Linux 6.19.14-101.fc42.x86_64
 
 Throughput sweeps (committed ops/s)
 -----------------------------------
 config                                        ops/s   e2e p50   e2e p99
-closed.c1.spin.b1                             14082        65       270
-closed.c16.block.b16                          86348       184       344
+closed.c1.spin.b1                             13302        73       112
+closed.c16.block.b16                          55137       274       688
 
 Open-loop rate sweep (CO-corrected e2e latency)
 -----------------------------------------------
 config                        offered  achieved      p50      p99    p99.9 abandoned
-open.base.rate5000               5000      5000      166      438     1163         0
-open.base.rate10000             10000     10000      143      291     1278         0
-open.base.rate15000             15000     15000      152     1016     4784         0
-open.base.rate20000             20000     20000      231     3375    17302         0
-open.base.rate25000             25000     25000      598    10748    18612         0
-open.base.rate30000             30000     30000   241172  1207960  1358954         0
-open.best.rate10000             10000     10000      340      582     1458         0
-open.best.rate20000             20000     20000      295      999     6160         0
-open.best.rate30000             30000     30000      291     1098     7668         0
-open.best.rate40000             40000     40000      299     1393     8782         0
-open.best.rate50000             50000     50000      332     2818    17826         0
-open.best.rate60000             60000     60000      348     8192    20709         0
-open.best.rate70000             70000     70000      422     8913    27525         0
+open.base.rate5000               5000      5000      182      299      639         0
+open.base.rate10000             10000     10000      184      279      672         0
+open.base.rate15000             15000     15000      217      496     3441         0
+open.base.rate20000             20000     20000      303     1229     5571         0
+open.base.rate25000             25000     25000    11665   120586   352322         0
+open.base.rate30000             30000     30000  1241514  2650800  2952790         0
+open.best.rate10000             10000     10000      352      549      696         0
+open.best.rate20000             20000     20000      340      508     1868         0
+open.best.rate30000             30000     30000      283      422     4162         0
+open.best.rate40000             40000     40000      283      406     4260         0
+open.best.rate50000             50000     50000      295      598    14156         0
+open.best.rate60000             60000     60000      336      885    15073         0
+open.best.rate70000             70000     70000      393     1933    17826         0
 
 Headline latency (stated offered load; us)
 ------------------------------------------
 series                                    p50        p99      p99.9     p99.99        max
 headline.base @14000/s (280001 samples/run)
-  e2e (intended send)                     154       1458       5308       9044      10393
-  e2e (actual send)                        97       1343       3736       8782      10337
-  commit (leader internal)                 55        348       1458       4653       9782
-headline.best @28000/s (560001 samples/run)
-  e2e (intended send)                     291       1040      11272      17564      18623
-  e2e (actual send)                       236        705       3015       9437      18568
-  commit (leader internal)                168        393       1458       7406      18466
+  e2e (intended send)                     147        295       3998       8782      10391
+  e2e (actual send)                        93        238       3080       8651      10337
+  commit (leader internal)                 53        114       1040       4784      10092
+headline.best @49000/s (980000 samples/run)
+  e2e (intended send)                     307        565      28574      38273      38747
+  e2e (actual send)                       256        483        860      10224      38107
+  commit (leader internal)                154        315        479       8782      37945
 
 Failover (leader kill under load)
 ---------------------------------
-n=30  p50=278ms  p99=280ms  max=280ms
+n=30  p50=278ms  p99=633ms  max=633ms
 
 Sustained faults (open-loop at fixed offered load)
 --------------------------------------------------
