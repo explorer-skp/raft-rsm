@@ -1,4 +1,4 @@
-PHASE 8 BENCHMARK SUMMARY (medians of repeats; latencies in us)
+BENCHMARK SUMMARY — KV workload (medians of repeats; latencies in us)
 host: 12th Gen Intel(R) Core(TM) i5-1235U | 12 cpus | governor=performance no_turbo=0 | Linux 6.19.14-101.fc42.x86_64
 
 Throughput sweeps (committed ops/s)

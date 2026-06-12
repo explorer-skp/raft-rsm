@@ -1,4 +1,4 @@
-PHASE 8 BENCHMARK SUMMARY (medians of repeats; latencies in us)
+BENCHMARK SUMMARY — ORDERBOOK workload (medians of repeats; latencies in us)
 host: 12th Gen Intel(R) Core(TM) i5-1235U | 12 cpus | governor=performance no_turbo=0 | Linux 6.19.14-101.fc42.x86_64
 
 Throughput sweeps (committed ops/s)
@@ -39,9 +39,5 @@ headline.best @49000/s (980000 samples/run)
 Failover (leader kill under load)
 ---------------------------------
 n=30  p50=278ms  p99=633ms  max=633ms
-
-Sustained faults (open-loop at fixed offered load)
---------------------------------------------------
-config                     achieved/s      p50      p99 elections
 
 invalid runs: none

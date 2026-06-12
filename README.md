@@ -358,32 +358,56 @@ in a ±10-tick band around 100 so matching is continuous, qty 1–10), same
 open-loop CO-corrected methodology, same leadership-validity gates, same
 stated-load criterion. Raw data: `bench/results/phase9/`.
 
-**Host-state caveat for this table (stated, not hidden):** this result set
-was recorded with the CPU governor at `powersave` (the per-run JSON records
-it; the KV suite above ran under `performance`), so the two suites'
-absolute numbers are not directly comparable — treat these as conservative
-on an uncontrolled host. The script re-derives every number, and sets the
-governor when run with sudo available.
+**Host state for this set (the per-run records caught a real event):**
+every JSON embeds the machine state at run start *and* end, and they show
+the CPU governor flipping `performance` → `powersave` mid-suite (during
+`open.best.rate30000.r1` — most likely a power-profile/AC event). So: the
+closed-loop cells, the single-client cell, and the entire no-batching
+sweep ran under `performance` (directly comparable to the KV suite); the
+upper best-config sweep, both headline cells, and the failover ran under
+`powersave` (conservative; not strictly comparable). One uninterrupted
+re-run of the script under `performance` collapses this caveat; the
+numbers below are honest for the recorded state. Medians of 3 repeats,
+seeds printed, rev stamped in `machine.txt`.
 
 | measurement | result |
 |---|---|
-| closed-loop saturation (16 clients, batch 16) | **86,348 orders/s matched+committed** |
-| single client, no batching, busy-spin | 14,082 orders/s; e2e p50 **65 µs** |
-| stated load, no batching (14 k orders/s offered) | e2e p50 154 µs, p99 1.5 ms; **commit p50 55 µs / p99 348 µs** |
-| stated load, batch 16 (28 k orders/s offered) | e2e p50 291 µs, p99 1.0 ms; commit p50 168 µs |
-| open-loop knee (batch 16) | p99 ≤ 1.4 ms through 40 k/s; offered rate still fully served at 70 k/s with p99 8.9 ms |
-| failover under order load (30 leader kills) | next committed order: p50 278 ms, max 280 ms |
+| closed-loop saturation (16 clients, batch 16) | **55,137 orders/s matched+committed** |
+| single client, no batching, busy-spin | 13,302 orders/s; e2e p50 **73 µs** |
+| stated load, no batching (14 k orders/s offered) | e2e p50 147 µs, p99 295 µs; **commit p50 53 µs / p99 114 µs** |
+| stated load, batch 16 (49 k orders/s offered) | e2e p50 307 µs, p99 565 µs; commit p50 154 µs / p99 315 µs |
+| open-loop knee (batch 16) | p99 ≤ 600 µs through 50 k/s; offered rate still fully served at 70 k/s with p99 1.9 ms |
+| failover under order load (30 leader kills) | next committed order: p50 278 ms, p99 = max = 633 ms |
 | validity | zero invalid runs; zero clean-load elections |
+
+At the 49 k/s stated load the CO gap shows up on matching-engine data just
+as it did on KV: p99.9 from intended send = 28.6 ms vs 0.86 ms from actual
+send — transient backlogs charged to the orders that waited through them.
 
 ![order-book latency vs throughput](bench/results/phase9/plots/latency_vs_throughput.png)
 
-The shape matches the KV curves: the consensus path, not the matcher,
-dominates — matching against the book costs map/deque operations measured
-in nanoseconds against a commit pipeline measured in tens of microseconds.
-That is the architectural claim made concrete: once ordering comes from
-the replicated log, a deterministic matching engine rides on it at
-consensus speed, with State Machine Safety carrying the same guarantee for
-fills that it carries for key-value writes.
+**Why these aren't identical to the KV numbers — and why the differences
+point the right way.** The deltas go in *opposite directions* (commit p50
+53 µs vs KV's 76 µs and a 49 k vs 35 k stated load, but 55 k vs 69 k
+closed-loop saturation), so this is not "the matcher is faster than a map
+insert". The comparisons that share host state settle it: single-client
+p50 is 73 µs vs the KV suite's 72 µs (both `performance`) — the per-op
+pipeline cost is identical, and both state machines' apply work is noise
+against the consensus path. The systematic differences are wire-shaped: a
+NEW order command is smaller than the KV PUT (34 vs ~43 bytes — lighter
+append/replication per entry, which favors the unbatched open-loop cells),
+while order-book replies carry a fills payload instead of KV's one status
+byte (more per-reply client work, which costs at closed-loop saturation
+where 16 client threads fight 12 pipeline threads for 12 hardware
+threads). The headline-cell deltas (commit p50, stated load) additionally
+carry the governor confound above — they were recorded under `powersave` —
+and the higher stated load is partly the rep-robust criterion itself: the
+KV run had one 60 k/s repeat blow the p99.9 bound (a 258 ms backlog
+episode), capping its sustainable rate at 50 k, while every order-book
+repeat held the bounds through 70 k. The architectural claim survives all
+of it: ordering comes from the replicated log, the deterministic matching
+fold rides on it at consensus speed, and State Machine Safety carries the
+same guarantee for fills that it carries for key-value writes.
 
 ## Build, run, test
 

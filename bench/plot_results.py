@@ -262,7 +262,12 @@ def write_summary(runs, outdir: Path):
     lines = []
     a = lines.append
     machine = next(iter(runs.values()))[0]["machine_start"]
-    a("PHASE 8 BENCHMARK SUMMARY (medians of repeats; latencies in us)")
+    # Shared by the Phase 8 KV suite and the Phase 9 order-book suite; the
+    # state machine is recorded per run, so name it in the title.
+    sms = {d["config"].get("sm", "kv") for docs in runs.values() for d in docs}
+    workload = "/".join(sorted(sms)).upper()
+    a(f"BENCHMARK SUMMARY — {workload} workload "
+      "(medians of repeats; latencies in us)")
     a(f"host: {machine['cpu_model']} | {machine['cpus']} cpus | "
       f"governor={machine['governors']} no_turbo={machine['intel_pstate_no_turbo']} | "
       f"{machine['kernel']}")
@@ -337,19 +342,23 @@ def write_summary(runs, outdir: Path):
                   f"max={ms[-1]:.0f}ms")
         a("")
 
-    section("Sustained faults (open-loop at fixed offered load)")
-    a(f"{'config':26s} {'achieved/s':>10s} {'p50':>8s} {'p99':>8s} "
-      f"{'elections':>9s}")
-    for lbl in sorted(runs):
-        if not lbl.startswith("fault."):
-            continue
-        docs = runs[lbl]
-        hist = "e2e_intended" if ".open." in lbl else "e2e_actual"
-        a(f"{lbl:26s} {medres(docs, 'throughput_cps'):10.0f} "
-          f"{medhist(docs, hist, 'p50_ns') / US:8.0f} "
-          f"{medhist(docs, hist, 'p99_ns') / US:8.0f} "
-          f"{medres(docs, 'elections_in_window'):9.0f}")
-    a("")
+    # Only emitted when fault cells exist in this result set (the Phase 9
+    # order-book suite has none: fault behavior is SM-independent and is
+    # measured once, in the Phase 8 set).
+    if any(lbl.startswith("fault.") for lbl in runs):
+        section("Sustained faults (open-loop at fixed offered load)")
+        a(f"{'config':26s} {'achieved/s':>10s} {'p50':>8s} {'p99':>8s} "
+          f"{'elections':>9s}")
+        for lbl in sorted(runs):
+            if not lbl.startswith("fault."):
+                continue
+            docs = runs[lbl]
+            hist = "e2e_intended" if ".open." in lbl else "e2e_actual"
+            a(f"{lbl:26s} {medres(docs, 'throughput_cps'):10.0f} "
+              f"{medhist(docs, hist, 'p50_ns') / US:8.0f} "
+              f"{medhist(docs, hist, 'p99_ns') / US:8.0f} "
+              f"{medres(docs, 'elections_in_window'):9.0f}")
+        a("")
 
     invalid = [lbl for lbl, docs in runs.items()
                if any(not d["results"]["valid"] for d in docs)]

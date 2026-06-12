@@ -1544,3 +1544,35 @@ partition p99, batch-vs-concurrency rule), clone instructions correct for
 the inner-repo/gitlink structure and smoke-tested from a clean checkout.
 Release, ASan/UBSan, and TSan gates green via `./build_and_test.sh`
 (12 ctest targets per config).
+
+**Phase 9 dataset refresh (2026-06-12).** The operator re-ran
+`bench/run_orderbook_bench.sh` at rev `a7c7e8a` intending a
+governor=`performance` set to supersede the original powersave-only one
+(committed as `cf1152b`; the phase note's 86 k/65 µs figures are from the
+superseded set). Verified independently afterward: both script invocations
+carry `--sm orderbook` and all 52 JSONs record `"sm":"orderbook"` — the
+showcase numbers are genuinely the matching engine; the old "PHASE 8"
+summary title was a shared un-parameterized printer, now fixed
+(`plot_results.py` names the recorded workload in the title and omits the
+sustained-faults section when a result set has no fault cells — fault
+behavior is SM-independent and lives in the Phase 8 set). One real finding
+from the per-run start/end machine capture: the governor flipped
+`performance` → `powersave` MID-SUITE, during `open.best.rate30000.r1`
+(likely a power-profile/AC event — so the governor is not only a per-boot
+concern). Cell map: closed-loop cells, the single-client cell, and the
+full base sweep ran under performance; the upper best-config sweep, both
+headline cells, and the failover ran under powersave. Refreshed headlines
+with that caveat: closed-loop saturation 55,137 orders/s (performance);
+single-client 13,302 orders/s at p50 73 µs vs the KV suite's 72 µs — the
+same-state datum showing both SMs' apply cost is noise on the consensus
+path; headline.base @14 k: e2e p50/p99 = 147/295 µs, commit 53/114 µs;
+headline.best @49 k: e2e 307/565 µs, commit 154/315 µs, p99.9 28.6 ms
+intended vs 0.86 ms actual (the CO gap on matching-engine data); failover
+n=30 p50 278 ms, p99 = max = 633 ms; zero invalid runs. The
+opposite-direction deltas vs KV (lower commit p50 and higher stated load,
+but lower closed-loop saturation) are explained in the README: identical
+pipeline cost at one client, wire-shape effects (34-byte NEW vs ~43-byte
+PUT commands; fills-payload replies vs 1-byte), the powersave confound on
+the headline cells, and the rep-robust stated-load criterion. A single
+uninterrupted re-run under performance collapses the caveat to one line;
+until then the README states the mixed host state precisely.
