@@ -7,6 +7,7 @@
 
 #include "rpc/messages.h"
 #include "statemachine/kv_store.h"
+#include "statemachine/order_book.h"
 #include "transport/frame.h"
 #include "transport/transport.h"
 
@@ -60,6 +61,19 @@ public:
                               const std::string& desired);
     std::optional<Result> append(const std::string& key,
                                  const std::string& suffix);
+
+    // Order-book operations (Phase 9): the identical session, routing, and
+    // retry machinery — only the command bytes differ, which is the point
+    // of the shared StateMachine seam. Meaningful only against a cluster
+    // running the order-book SM. Result.status carries the order-book
+    // status byte; Result.value is the binary payload (prepend the status
+    // byte and feed decodeObResult for the order id and fills).
+    std::optional<Result> obNew(rsm::statemachine::ObSide side,
+                                std::uint64_t price, std::uint64_t qty);
+    std::optional<Result> obCancel(std::uint64_t orderId);
+    std::optional<Result> obAmend(std::uint64_t orderId,
+                                  std::uint64_t newPrice,
+                                  std::uint64_t newQty);
 
     // Test hook: re-issues the LAST request with its original
     // (clientId, seqNo) — exactly what the retry loop does internally after

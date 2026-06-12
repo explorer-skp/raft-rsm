@@ -44,10 +44,22 @@ private:
 };
 
 struct WorkloadConfig {
+    // Which command set the clients speak. Kv drives the Phase 6 KV
+    // workload (and the linearizability checker); OrderBook drives
+    // NEW/CANCEL/AMEND against the matching engine (Phase 9) — same
+    // protocol, same retry/identity rules, different command bytes.
+    enum class Kind { Kv, OrderBook };
+    Kind kind = Kind::Kv;
     int opsPerClient = 12;  // upper bound; faults may let fewer fit
     int keySpace = 4;  // keys "k0".."k{keySpace-1}" — small, for contention
     // Op mix weights (PUT/GET/APPEND/CAS/DELETE), normalized internally.
     int wPut = 30, wGet = 25, wAppend = 20, wCas = 15, wDelete = 10;
+    // OrderBook workload: NEW prices uniform in [priceBase - priceBand,
+    // priceBase + priceBand] (a band tight enough to cross constantly),
+    // qty in [1, qtyMax]. CANCEL/AMEND target an order this client saw
+    // rest in a NEW/AMEND ack; with none resting they fall back to NEW.
+    int wNew = 70, wCancel = 15, wAmend = 15;
+    std::uint64_t priceBase = 100, priceBand = 10, qtyMax = 10;
     std::int64_t requestTimeoutMs = 400;
     std::int64_t retryBackoffMs = 25;
     // Seeded think time between an op's acknowledgment and the next
@@ -86,6 +98,10 @@ private:
 
     void onDeliver(NodeId from, NodeId to, Message&& m);
     void issueNextOp(bool marker);
+    void issueKvOp(bool marker);
+    void issueOrderOp(bool marker);
+    // Updates myOrders_ from an OK reply's decoded order-book result.
+    void onOrderAck(const std::string& result);
     void sendAttempt();
     NodeId nextTarget();
     std::string key();
@@ -108,6 +124,12 @@ private:
     NodeId attemptEnvelope_ = 0;
     NodeId target_ = 0;        // node the current attempt went to
     NodeId believedLeader_ = 0;
+    // OrderBook mode: ids this client saw resting (from NEW/AMEND acks),
+    // the CANCEL/AMEND target pool. currentObOp_/currentObTarget_ remember
+    // what the in-flight op was so its ack updates the pool correctly.
+    std::vector<std::uint64_t> myOrders_;
+    int currentObOp_ = 0;
+    std::uint64_t currentObTarget_ = 0;
     std::int64_t deadlineMs_ = 0;  // timeout (Waiting) or resend (Backoff)
     std::int64_t nextIssueAtMs_ = 0;
 };

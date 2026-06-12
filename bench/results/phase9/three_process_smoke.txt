@@ -1,0 +1,34 @@
+# Phase 9 three-process order-book smoke (2026-06-12T05:55:35Z)
+# Three raft_node --sm orderbook processes on loopback TCP; kv_cli ob-*
+# as a fourth process per op; then kill -9 of the live leader and a
+# crossing order served through the new leader.
+
+$ raft_node --id 1 --config peers.conf --data-dir n1 --sm orderbook &
+$ raft_node --id 2 --config peers.conf --data-dir n2 --sm orderbook &
+$ raft_node --id 3 --config peers.conf --data-dir n3 --sm orderbook &
+  node 1 listening on 127.0.0.1:6111 sm=orderbook (raft seed 3040225457)
+  [raft] node=1 term=1 role=Leader event=won-election
+  node 2 listening on 127.0.0.1:6112 sm=orderbook (raft seed 4244402833)
+  node 3 listening on 127.0.0.1:6113 sm=orderbook (raft seed 983301711)
+
+$ kv_cli ob-new sell 100 10
+OK order=1 resting=10
+$ kv_cli ob-new buy 100 4    # crosses: fills against order 1
+OK order=2 resting=0
+  fill maker=1 price=100 qty=4
+$ kv_cli ob-amend 1 100 3    # qty decrease keeps priority
+OK order=1 resting=3
+$ kv_cli ob-new buy 99 5     # rests below the ask
+OK order=3 resting=5
+$ kv_cli ob-cancel 1
+OK order=1 resting=3
+$ kv_cli ob-cancel 1         # again: deterministic reject
+REJECTED (unknown or no-longer-resting order)
+
+# kill -9 the leader (node 1); next order goes through the new leader
+$ kv_cli ob-new sell 99 2    # crosses resting order 4 across the failover
+OK order=4 resting=0
+  fill maker=3 price=99 qty=2
+
+  [raft] node=1 term=1 role=Leader event=won-election
+  [raft] node=2 term=2 role=Leader event=won-election

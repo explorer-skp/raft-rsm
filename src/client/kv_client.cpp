@@ -82,6 +82,28 @@ std::optional<KvClient::Result> KvClient::append(const std::string& key,
     return call(cmdScratch_);
 }
 
+std::optional<KvClient::Result> KvClient::obNew(rsm::statemachine::ObSide side,
+                                                std::uint64_t price,
+                                                std::uint64_t qty) {
+    rsm::statemachine::encodeObNewInto(cmdScratch_, clientId_, ++seqNo_, side,
+                                       price, qty);
+    return call(cmdScratch_);
+}
+
+std::optional<KvClient::Result> KvClient::obCancel(std::uint64_t orderId) {
+    rsm::statemachine::encodeObCancelInto(cmdScratch_, clientId_, ++seqNo_,
+                                          orderId);
+    return call(cmdScratch_);
+}
+
+std::optional<KvClient::Result> KvClient::obAmend(std::uint64_t orderId,
+                                                  std::uint64_t newPrice,
+                                                  std::uint64_t newQty) {
+    rsm::statemachine::encodeObAmendInto(cmdScratch_, clientId_, ++seqNo_,
+                                         orderId, newPrice, newQty);
+    return call(cmdScratch_);
+}
+
 std::optional<KvClient::Result> KvClient::resendLast() {
     // Same bytes, same (clientId, seqNo): the dedup table makes this safe no
     // matter how many times it lands or on which leader.

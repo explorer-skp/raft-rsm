@@ -49,6 +49,15 @@ struct GenConfig {
     std::uint64_t seed = 1;
     int keys = 64;
     int valueBytes = 16;
+    // Order-book workload (Phase 9): when set, every op is a NEW limit
+    // order — side uniform, price uniform in [priceBase - priceBand,
+    // priceBase + priceBand], qty in [1, qtyMax] — against a cluster built
+    // with orderBook=true. The symmetric band keeps the resting book in a
+    // bounded random walk while making continuous matching the common
+    // case, so the benchmark measures the engine matching, not just
+    // appending.
+    bool orderBook = false;
+    std::uint64_t priceBase = 100, priceBand = 10, qtyMax = 10;
     // Open-loop only: total offered rate across all threads.
     double ratePerSec = 1000.0;
     // Open-loop only: give up replaying a late schedule this long past the

@@ -41,6 +41,7 @@ using namespace rsm::bench;
 
 struct Options {
     std::string mode = "closed";
+    bool orderBook = false;  // --sm orderbook: NEW-order workload (Phase 9)
     std::uint64_t seed = 1;
     int seconds = 10;
     int warmup = 3;
@@ -68,6 +69,7 @@ int usage(const char* argv0) {
     std::fprintf(
         stderr,
         "usage: %s --mode closed|open|failover [options]\n"
+        "  --sm kv|orderbook (workload + replicated state machine)\n"
         "  --seed N --seconds S --warmup W --threads T --keys K\n"
         "  --value-bytes B --data-base DIR --fsync every|group\n"
         "  --wait block|spin --batch N --linger-us N --pin\n"
@@ -90,6 +92,7 @@ void writeConfig(JsonWriter& w, const Options& o) {
     w.key("config");
     w.beginObject();
     w.kv("mode", o.mode);
+    w.kv("sm", o.orderBook ? "orderbook" : "kv");
     w.kv("seed", o.seed);
     w.kv("seconds", o.seconds);
     w.kv("warmup", o.warmup);
@@ -136,6 +139,16 @@ int main(int argc, char** argv) {
             const char* v = next();
             if (!v) return usage(argv[0]);
             opt.mode = v;
+        } else if (is("--sm")) {
+            const char* v = next();
+            if (!v) return usage(argv[0]);
+            if (std::strcmp(v, "kv") == 0) {
+                opt.orderBook = false;
+            } else if (std::strcmp(v, "orderbook") == 0) {
+                opt.orderBook = true;
+            } else {
+                return usage(argv[0]);
+            }
         } else if (is("--seed")) {
             const char* v = next();
             if (!v) return usage(argv[0]);
@@ -243,11 +256,12 @@ int main(int argc, char** argv) {
 
     // Print the full config up front — the reproducibility contract.
     std::printf(
-        "rsm_bench mode=%s seed=%llu seconds=%d warmup=%d threads=%d "
+        "rsm_bench mode=%s sm=%s seed=%llu seconds=%d warmup=%d threads=%d "
         "rate=%.0f trials=%d keys=%d value-bytes=%d data-base=%s fsync=%s "
         "wait=%s batch=%d linger-us=%d pin=%d loss-pct=%.2f "
         "partition=%dms/%dms label=%s\n",
-        opt.mode.c_str(), static_cast<unsigned long long>(opt.seed),
+        opt.mode.c_str(), opt.orderBook ? "orderbook" : "kv",
+        static_cast<unsigned long long>(opt.seed),
         opt.seconds, opt.warmup, opt.threads, opt.rate, opt.trials, opt.keys,
         opt.valueBytes, opt.dataBase.c_str(), fsyncName(opt.fsync),
         waitName(opt.wait), opt.batch, opt.lingerUs, opt.pin ? 1 : 0,
@@ -264,6 +278,7 @@ int main(int argc, char** argv) {
         machineStart.maxTempC);
 
     BenchClusterConfig ccfg;
+    ccfg.orderBook = opt.orderBook;
     ccfg.dataBase = opt.dataBase;
     ccfg.fsync = opt.fsync;
     ccfg.wait = opt.wait;
@@ -312,6 +327,7 @@ int main(int argc, char** argv) {
     }
 
     GenConfig gcfg;
+    gcfg.orderBook = opt.orderBook;
     gcfg.threads = opt.threads;
     gcfg.seed = opt.seed;
     gcfg.keys = opt.keys;
@@ -364,9 +380,17 @@ int main(int argc, char** argv) {
             if (victim == 0) continue;
             const std::uint64_t killNs = nowNs();
             cluster.killNode(victim);
-            const auto r = probe.put("__failover_probe", "x");
+            // One committed write in the configured SM's command set spans
+            // the outage (the order-book probe rests a 1-lot bid at the
+            // minimum tick, same as awaitReady's — it can never cross).
+            const auto r =
+                opt.orderBook
+                    ? probe.obNew(rsm::statemachine::ObSide::Bid, 1, 1)
+                    : probe.put("__failover_probe", "x");
             const std::uint64_t okNs = nowNs();
-            if (r && r->status == rsm::statemachine::kKvOk) {
+            const char okStatus = opt.orderBook ? rsm::statemachine::kObOk
+                                                : rsm::statemachine::kKvOk;
+            if (r && r->status == okStatus) {
                 const double ms =
                     static_cast<double>(okNs - killNs) / 1e6;
                 failoverMs.push_back(ms);

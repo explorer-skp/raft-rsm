@@ -1,8 +1,10 @@
 #include "faults/sim_client.h"
 
+#include <algorithm>
 #include <variant>
 
 #include "statemachine/kv_store.h"
+#include "statemachine/order_book.h"
 
 namespace rsm::sim {
 
@@ -11,6 +13,7 @@ using rsm::rpc::ClientRequest;
 using rsm::rpc::ClientStatus;
 using rsm::statemachine::encodeKvCommand;
 using rsm::statemachine::KvOp;
+using rsm::statemachine::ObSide;
 
 void History::invoke(const ClientOp& op) {
     ops_[{op.clientId, op.seqNo}] = op;
@@ -72,6 +75,20 @@ void SimClient::issueNextOp(bool marker) {
     current_.clientId = clientId_;
     current_.seqNo = ++seqNo_;
     current_.invokeMs = now;
+    if (cfg_.kind == WorkloadConfig::Kind::OrderBook) {
+        issueOrderOp(marker);
+    } else {
+        issueKvOp(marker);
+    }
+    history_.invoke(current_);
+    ++opsIssued_;
+    harness_.traceEvent("t=" + std::to_string(now) + " c" +
+                        std::to_string(clientId_) + " invoke seq=" +
+                        std::to_string(current_.seqNo));
+    sendAttempt();
+}
+
+void SimClient::issueKvOp(bool marker) {
     current_.key = key();
     const int total = cfg_.wPut + cfg_.wGet + cfg_.wAppend + cfg_.wCas +
                       cfg_.wDelete;
@@ -106,12 +123,56 @@ void SimClient::issueNextOp(bool marker) {
     currentCommand_ = encodeKvCommand(clientId_, current_.seqNo, current_.op,
                                       current_.key, current_.arg,
                                       current_.arg2);
-    history_.invoke(current_);
-    ++opsIssued_;
-    harness_.traceEvent("t=" + std::to_string(now) + " c" +
-                        std::to_string(clientId_) + " invoke seq=" +
-                        std::to_string(current_.seqNo));
-    sendAttempt();
+}
+
+void SimClient::issueOrderOp(bool marker) {
+    const int total = cfg_.wNew + cfg_.wCancel + cfg_.wAmend;
+    int pick = marker ? 0  // the post-heal marker is always a NEW
+                      : static_cast<int>(
+                            rng_() % static_cast<std::uint64_t>(total));
+    // CANCEL/AMEND need a resting order of ours; with none, issue NEW. The
+    // rng_() draws stay identical either way (the pick already happened).
+    if (pick >= cfg_.wNew && myOrders_.empty()) pick = 0;
+    const auto price = [this] {
+        return cfg_.priceBase - cfg_.priceBand +
+               rng_() % (2 * cfg_.priceBand + 1);
+    };
+    const auto qty = [this] { return 1 + rng_() % cfg_.qtyMax; };
+    if (pick < cfg_.wNew) {
+        currentObOp_ = 1;
+        const auto side = static_cast<ObSide>(rng_() % 2);
+        rsm::statemachine::encodeObNewInto(currentCommand_, clientId_,
+                                           current_.seqNo, side, price(),
+                                           qty());
+    } else if (pick < cfg_.wNew + cfg_.wCancel) {
+        currentObOp_ = 2;
+        currentObTarget_ = myOrders_[rng_() % myOrders_.size()];
+        rsm::statemachine::encodeObCancelInto(currentCommand_, clientId_,
+                                              current_.seqNo,
+                                              currentObTarget_);
+    } else {
+        currentObOp_ = 3;
+        currentObTarget_ = myOrders_[rng_() % myOrders_.size()];
+        rsm::statemachine::encodeObAmendInto(currentCommand_, clientId_,
+                                             current_.seqNo, currentObTarget_,
+                                             price(), qty());
+    }
+}
+
+void SimClient::onOrderAck(const std::string& result) {
+    const auto r = rsm::statemachine::decodeObResult(result);
+    if (!r) return;
+    const std::uint64_t id = currentObOp_ == 1 ? r->orderId : currentObTarget_;
+    const auto it = std::find(myOrders_.begin(), myOrders_.end(), id);
+    // A rejected CANCEL/AMEND means the order is gone (filled by someone
+    // else's taker): drop the stale id from the pool too.
+    const bool resting = r->status == rsm::statemachine::kObOk &&
+                         currentObOp_ != 2 && r->restingQty > 0;
+    if (resting && it == myOrders_.end()) {
+        myOrders_.push_back(id);
+    } else if (!resting && it != myOrders_.end()) {
+        myOrders_.erase(it);  // canceled, fully filled, or already gone
+    }
 }
 
 NodeId SimClient::nextTarget() {
@@ -171,9 +232,12 @@ void SimClient::onDeliver(NodeId from, NodeId to, Message&& m) {
     const std::int64_t now = harness_.nowMs();
     switch (reply->status) {
         case ClientStatus::Ok: {
+            std::string result(reply->result.begin(), reply->result.end());
+            if (cfg_.kind == WorkloadConfig::Kind::OrderBook) {
+                onOrderAck(result);
+            }
             history_.complete(clientId_, current_.seqNo, now,
-                              std::string(reply->result.begin(),
-                                          reply->result.end()));
+                              std::move(result));
             believedLeader_ = from;
             state_ = State::Idle;
             nextIssueAtMs_ =

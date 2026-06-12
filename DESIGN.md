@@ -1068,10 +1068,128 @@ sweeps for two open-loop configs (`base` = no batching + block,
 documented by-construction equivalence (the real fsync knob is the batch
 size: batch=1 ⇒ fsync per entry, batch=N ⇒ one fsync per N).
 
+## The order-book matching engine (Phase 9)
+
+### The framing (why this is the showcase SM)
+
+The Raft log is a deterministic total-order sequencer. A matching engine's
+price-**time** priority is "first come, first served within a price level" —
+and in this system *arrival order is committed-log order*, identical on every
+replica by State Machine Safety. So the matching engine is a pure
+deterministic fold over the sequence Raft already agrees on: no clock, no
+tie-breaking heuristics, nothing to coordinate beyond what consensus already
+provides. The KV store and the order book are two folds over the same agreed
+sequence behind the same `StateMachine` interface — swapping one for the
+other touched zero Raft/runtime/transport code, which is the proof that the
+spec's layering held.
+
+### Command/result formats
+
+`src/statemachine/order_book.h` documents the byte layouts. The essentials:
+the command starts with the same 16-byte `(clientId, seqNo)` identity prefix
+as KV commands — so `ClientService`'s identity validation and the dedup
+convention carry over untouched — followed by `op` (1=NEW 2=CANCEL 3=AMEND)
+and integer fields only: side (one byte, 0/1), price in ticks (u64 ≥ 1),
+quantity in lots (u64 ≥ 1). **Never floating point** — FP matching can
+diverge across machines/compilers and silently break State Machine Safety.
+Results: `'O' orderId restingQty nFills {makerOrderId, price, qty}*` (fills
+execute at the **maker's** price), `'N'` deterministic reject
+(CANCEL/AMEND of an unknown/gone order), `'E'` malformed (no side effect,
+never cached — the KV convention).
+
+### Decision points (phase prompt §"Decision points")
+
+1. **AMEND priority semantics** (exchange-like default, as recommended):
+   at the same price, a quantity decrease (or no-op) amends **in place** and
+   keeps time priority; a price change or quantity increase is
+   cancel-replace — the order keeps its **id** but loses priority and is
+   re-matched like a new order (a price change can cross and fill
+   immediately). Alternatives considered: always-lose-priority (simpler,
+   but punishes the common risk-reducing decrease) and new-id-per-amend
+   (closer to some venues' wire protocols but complicates client tracking
+   for no correctness gain). Deterministic either way; this one is
+   documented and unit-tested per branch.
+2. **Order-ID scheme:** a u64 counter in applied state (`nextOrderId_`,
+   starts at 1), advanced once per accepted NEW; AMEND keeps the id; the
+   counter is serialized with the book. Identical on every replica because
+   it only moves inside `apply()`. Client-supplied or hash-derived ids were
+   rejected: they push uniqueness/determinism obligations onto clients.
+3. **Book structure:** per side a `std::map<price, std::deque<Resting>>`
+   (bids walked from `rbegin`, asks from `begin`) plus an
+   `orderId -> (side, price)` locator map; CANCEL scans its level's deque
+   linearly. Deterministic iteration everywhere (ordered containers only).
+   Chosen for correctness-first clarity per the prompt's "do not gold-plate
+   the matcher's internals" — the measured cost is in the consensus path,
+   not the matcher (see the Phase 9 numbers).
+4. **Correctness checking:** golden-model equivalence + cross-replica
+   identity (the recommended pair), three layers deep:
+   (a) unit-level golden streams — seeded randomized command streams through
+   the engine and an **independent reference matcher**
+   (`test/ob_reference.h`: flat order vector, arrival stamps, linear scans,
+   its own parsing/encoding — deliberately nothing like the engine), every
+   per-command result byte-compared and final books compared; self-validated
+   by three deliberately mis-implemented reference variants (FIFO inverted,
+   price priority ignored, taker-price fills) that the comparison must FLAG;
+   (b) in every order-book chaos run — at quiescence all live replicas'
+   `serialize()` bytes (book + id counter + session table) must be
+   identical, and a fresh engine folding the committed log must land on
+   exactly that state;
+   (c) per chaos seed — the committed command stream is replayed through the
+   reference matcher and the final books must match (golden equivalence on
+   real consensus output, not just synthetic streams).
+   Extending the per-key WGL linearizability checker to order-book
+   semantics is recorded as future work (the spec marks it optional); the
+   direct state checks above are the matching-engine-shaped substitute.
+5. **Architecture diagram:** Mermaid in the README (renders on GitHub,
+   diffable in review) for module/data flow, plus the ASCII thread-topology
+   diagram carried over from Phase 7 — both checked against the code.
+6. **Benchmark:** yes — through the Phase 8 harness unchanged (open-loop,
+   CO-corrected, leadership-validity gates, repeats/seeds/medians,
+   `pick_rate.py` stated loads, `plot_results.py` plots), driven by
+   `bench/run_orderbook_bench.sh`. Workload: NEW orders, side uniform,
+   price uniform in [90, 110], qty 1–10 — the symmetric band makes
+   matching continuous while the resting book stays a bounded random walk.
+
+### Sessions: deliberate duplication, not a shared layer
+
+The dedup/session table is implemented inside `OrderBookStateMachine`
+exactly as inside `KVStateMachine` (same rules: apply-time check on every
+replica, `seqNo <= lastSeq` returns the cached latest result with no side
+effect, `clientId 0` opts out, malformed never cached, table serialized
+with the state). The ~20 duplicated lines were chosen over extracting a
+shared session helper because that refactor would touch the evolved,
+heavily-tested KV file for zero behavior change (surgical-edits rule).
+**Exactly-once has real teeth here:** re-applying a retried NEW would
+re-match it — `order_session_sim_test.cpp` replays the Phase 5
+retry-across-leader-failover scenario against resting liquidity and
+asserts the fill happened once and the cached fills come back identical.
+
+### Honest notes
+
+- **Self-trade prevention is out of scope:** orders carry no owner, so a
+  client's buy can match its own resting sell (deterministically). Real
+  venues add policy here; it is policy, not consensus correctness.
+- **No query/market-data op:** the engine answers order entry only; tests
+  read the book through accessors/serialize. A read path would mirror the
+  KV GET-through-the-log decision.
+- **Bench observer cost:** an order-book result (~20+ bytes) exceeds
+  libstdc++'s SSO, so the *load-generator* thread pays one small
+  allocation per completed op copying `Result.value` (KV PUT results are
+  1 byte and allocation-free, which is what `bench_alloc_tests` asserts).
+  This is on the client side of the socket, far from the measured
+  pipeline; recorded rather than redesigned around.
+- The order-book ops ride the existing `KvClient`
+  (`obNew/obCancel/obAmend` — same routing/retry/identity machinery,
+  different command bytes) and `kv_cli` gained `ob-new/ob-cancel/ob-amend`
+  for hand-poking; the recorded three-process smoke is
+  `bench/results/phase9/three_process_smoke.txt`.
+
 ## Parked non-goals
 
 Dynamic membership, snapshotting/compaction (stretch), multi-host/WAN, BFT, TLS/auth,
-query language — per spec §3.
+query language — per spec §3. Phase 9 adds: extending the formal
+linearizability checker to order-book semantics (golden-model + identity
+checks stand in), self-trade prevention, market/IOC/stop order types.
 
 ## Phase notes
 
@@ -1376,3 +1494,53 @@ asserts rx ≈ 0 (small per-connection budget) alongside the strict zero on
 raft/apply/tx. Also recorded: the repo-structure finding that the outer
 repo tracks `raft-rsm` as a bare gitlink, so phase commits must land in the
 inner repo first — Phases 5–7 content had been sitting uncommitted.
+
+**Phase 9 — Order-book matching engine and the writeup (2026-06-12).**
+The showcase state machine and the final README. `OrderBookStateMachine`
+(`src/statemachine/order_book.*`): NEW/CANCEL/AMEND limit-order matching
+with price-time priority where "time" is apply/log order, integer
+ticks/lots only, order ids from a counter in applied state, fills at the
+maker's price, the same 16-byte identity prefix and apply-time session
+dedup as the KV store (deliberately duplicated, not refactored out of the
+evolved KV file), full serialize/deserialize including the id counter and
+sessions, and a canonical `bookImage()` for comparisons — all decision
+points (AMEND semantics, id scheme, book structure, checking strategy,
+diagram format, benchmarking) recorded above. Zero changes to
+Raft/runtime/transport: the KV store and the order book are two folds
+behind one interface, selectable everywhere (`raft_node --sm`, `kv_cli
+ob-*`, `chaos_sim --sm`, `rsm_bench --sm`, sim/cluster factories).
+Correctness: 13 matching-unit cases (priority/FIFO/partial/sweep/cancel/
+amend branches/integer exactness/malformed/dedup/round-trip); golden-model
+equivalence vs an independent reference matcher over seeded streams,
+self-validated against three deliberately broken references; exactly-once
+across leader failover against resting liquidity (a re-applied NEW would
+double-fill — it does not); and the FULL Phase 6 chaos suite with the
+order-book SM at seeds 1–20 plus a same-seed determinism case: five
+invariants + no-lost-commit + convergence unchanged, with byte-identical
+replica books at quiescence, a fresh-engine fold of the committed log
+matching them, and a per-seed golden replay of the committed stream
+(`order_chaos_tests`; replay via `chaos_sim --seed N --sm orderbook`).
+Benchmark: `bench/run_orderbook_bench.sh` reuses the Phase 8 harness,
+stated-load criterion, and plot/summary tooling unchanged (labels keyed so
+`pick_rate.py`/`plot_results.py` work as-is) on a NEW-order workload in a
+±10-tick band: closed-loop saturation 86,348 orders/s (16 clients,
+batch 16, block, tmpfs); single-client spin 14,082 orders/s at p50 65 µs;
+stated loads 14 k/s (e2e p50/p99 = 154 µs/1.46 ms, commit 55/348 µs) and
+28 k/s batched (291 µs/1.04 ms, commit 168 µs); batch-16 knee p99 ≤ 1.4 ms
+through 40 k/s, offered rate still fully served at 70 k/s; failover under
+order load p50 278 ms / max 280 ms over 30 kills; zero invalid runs.
+HONEST CAVEAT recorded in the README and the raw JSON: this set was
+collected at governor=powersave (no sudo available in the session; the
+Phase 8 KV canonical set is governor=performance), so cross-suite absolute
+comparisons are off the table; the script regenerates under performance
+when run by the operator. A three-process order-book smoke incl. live
+leader kill -9 and a crossing order through the new leader is recorded at
+`bench/results/phase9/three_process_smoke.txt`. README rewritten as the
+final §10 deliverable: sequencer framing, Mermaid + thread-topology
+architecture, testing story top-billed, KV + order-book results with every
+Phase 8 honest framing carried forward (in-process topology, in-repo
+histogram, sustained-power caveat, open-loop-faults rationale, CO-window
+partition p99, batch-vs-concurrency rule), clone instructions correct for
+the inner-repo/gitlink structure and smoke-tested from a clean checkout.
+Release, ASan/UBSan, and TSan gates green via `./build_and_test.sh`
+(12 ctest targets per config).

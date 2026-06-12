@@ -16,6 +16,16 @@
 namespace rsm::sim {
 
 struct ChaosOptions {
+    // Which state machine the cluster replicates (Phase 9: both must
+    // survive the identical fault schedule behind the same interface).
+    // Kv runs the Phase 6 workload + linearizability check; OrderBook runs
+    // the NEW/CANCEL/AMEND workload, asserts byte-identical books across
+    // replicas at quiescence plus a fresh-replay equivalence, and exports
+    // the committed command stream for the golden-model check (the
+    // KV-register linearizability checker does not apply to a matching
+    // engine — DESIGN.md, Phase 9).
+    enum class Sm { Kv, OrderBook };
+    Sm sm = Sm::Kv;
     int nodes = 3;
     int clients = 4;
     int opsPerClient = 12;
@@ -41,6 +51,12 @@ struct ChaosReport {
     std::uint64_t finalCommitIndex = 0;
 
     std::vector<std::string> trace;  // filled iff options.recordTrace
+
+    // OrderBook runs only: the committed command stream (in log order, the
+    // sequence every replica folded) and the final canonical book image —
+    // the inputs the test layer's golden-model reference check replays.
+    std::vector<std::vector<std::uint8_t>> committedCommands;
+    std::string finalBookImage;
 
     std::string summary() const;
 };

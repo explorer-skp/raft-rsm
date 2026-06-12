@@ -61,6 +61,7 @@
 #include "raft/raft_core.h"
 #include "runtime/node_runtime.h"
 #include "statemachine/kv_store.h"
+#include "statemachine/order_book.h"
 #include "storage/durable_log.h"
 #include "storage/durable_state.h"
 #include "transport/transport.h"
@@ -172,6 +173,7 @@ private:
 
 struct BenchClusterConfig {
     int nodes = 3;
+    bool orderBook = false;                   // SM: KV (default) or matching engine
     std::string dataBase = "/dev/shm";       // node data dirs live under this
     rsm::storage::FsyncPolicy fsync =
         rsm::storage::FsyncPolicy::EveryDurabilityPoint;

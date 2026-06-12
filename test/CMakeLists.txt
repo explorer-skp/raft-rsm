@@ -12,6 +12,9 @@ add_executable(unit_tests
   durable_storage_test.cpp
   raft_persistence_sim_test.cpp
   kv_store_test.cpp
+  order_book_test.cpp
+  ob_golden_test.cpp
+  order_session_sim_test.cpp
   client_session_sim_test.cpp
   batching_equivalence_test.cpp
   histogram_test.cpp
@@ -111,7 +114,21 @@ target_link_libraries(faults_tests PRIVATE doctest faults_sim)
 add_test(NAME faults_tests COMMAND faults_tests)
 set_tests_properties(faults_tests PROPERTIES TIMEOUT 600)
 
+# Phase 9: the same chaos suite with the order-book SM swapped in, plus
+# the golden-model replay of every seed's committed stream. Own binary so
+# its runtime parallelizes with faults_tests under ctest.
+add_executable(order_chaos_tests
+  test_main.cpp
+  order_chaos_test.cpp
+)
+target_link_libraries(order_chaos_tests PRIVATE doctest faults_sim)
+
+add_test(NAME order_chaos_tests COMMAND order_chaos_tests)
+set_tests_properties(order_chaos_tests PROPERTIES TIMEOUT 600)
+
 # The one-command replay path itself is part of the contract: a seed that
 # fails in the suite must reproduce via this exact executable.
 add_test(NAME chaos_sim_replay COMMAND chaos_sim --seed 1)
 set_tests_properties(chaos_sim_replay PROPERTIES TIMEOUT 120)
+add_test(NAME chaos_sim_replay_ob COMMAND chaos_sim --seed 1 --sm orderbook)
+set_tests_properties(chaos_sim_replay_ob PROPERTIES TIMEOUT 120)

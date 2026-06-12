@@ -9,6 +9,7 @@
 #include "faults/sim_client.h"
 #include "faults/sim_harness.h"
 #include "faults/sim_temp_dir.h"
+#include "statemachine/order_book.h"
 #include "storage/durable_log.h"
 #include "storage/durable_state.h"
 
@@ -73,7 +74,14 @@ ChaosReport runChaos(std::uint64_t seed, const ChaosOptions& options) {
     ho.restartSeed = [sub](NodeId id, int incarnation) {
         return sub(2000 + 64ULL * id + static_cast<std::uint64_t>(incarnation));
     };
-    SimHarness harness(std::move(ho), storage);
+    const bool orderBook = options.sm == ChaosOptions::Sm::OrderBook;
+    const SmFactory smFactory =
+        orderBook ? SmFactory([](NodeId) {
+            return std::make_unique<
+                rsm::statemachine::OrderBookStateMachine>();
+        })
+                  : SmFactory(kvStateMachine);
+    SimHarness harness(std::move(ho), storage, smFactory);
     harness.net().setLatency(Duration(1), Duration(3));
 
     // --- seeded fault schedule and client workload
@@ -90,6 +98,8 @@ ChaosReport runChaos(std::uint64_t seed, const ChaosOptions& options) {
 
     History history;
     WorkloadConfig wc;
+    wc.kind = orderBook ? WorkloadConfig::Kind::OrderBook
+                        : WorkloadConfig::Kind::Kv;
     wc.opsPerClient = options.opsPerClient;
     wc.stopIssuingAtMs = options.faultEndMs;
     wc.finalOpAtMs = options.faultEndMs + 1500;
@@ -175,11 +185,54 @@ ChaosReport runChaos(std::uint64_t seed, const ChaosOptions& options) {
         }
         report.finalTerm = harness.core(leaders[0]).term();
         report.finalCommitIndex = commit;
+
+        if (orderBook) {
+            // State Machine Safety, checked directly on the showcase SM:
+            // at quiescence every live replica's book + session state must
+            // be byte-identical, and a fresh engine folding the committed
+            // sequence must land on exactly that state (replicas == a pure
+            // deterministic fold over the agreed log; the test layer's
+            // golden-model reference consumes committedCommands).
+            rsm::statemachine::OrderBookStateMachine replay;
+            for (rsm::rpc::LogIndex i = 1; i <= commit; ++i) {
+                const auto& cmd = log.entryAt(i).command;
+                replay.apply(cmd);
+                report.committedCommands.push_back(cmd);
+            }
+            const auto expected = replay.serialize();
+            report.finalBookImage = replay.bookImage();
+            for (NodeId id = 1;
+                 id <= static_cast<NodeId>(harness.nodeCount()); ++id) {
+                if (!harness.alive(id)) continue;
+                auto* book =
+                    dynamic_cast<rsm::statemachine::OrderBookStateMachine*>(
+                        &harness.sm(id));
+                if (book == nullptr) {
+                    report.violations.push_back(
+                        "BOOK IDENTITY: node " + std::to_string(id) +
+                        " is not running the order-book SM");
+                    continue;
+                }
+                if (book->serialize() != expected) {
+                    report.violations.push_back(
+                        "BOOK IDENTITY: node " + std::to_string(id) +
+                        "'s book/session state diverges from the committed-"
+                        "sequence fold\nnode:\n" + book->bookImage() +
+                        "fold:\n" + report.finalBookImage);
+                }
+            }
+        }
     }
 
-    const auto lin = checkLinearizable(history.ops());
-    if (!lin.ok) {
-        report.violations.push_back("LINEARIZABILITY: " + lin.explanation);
+    // The per-key register linearizability checker models KV semantics; the
+    // order-book run substitutes the direct state checks above (extending
+    // the formal checker to the matching engine is recorded future work).
+    if (!orderBook) {
+        const auto lin = checkLinearizable(history.ops());
+        if (!lin.ok) {
+            report.violations.push_back("LINEARIZABILITY: " +
+                                        lin.explanation);
+        }
     }
 
     report.totalOps = history.totalCount();

@@ -23,6 +23,7 @@
 #include "raft/raft_core.h"
 #include "runtime/node_runtime.h"
 #include "statemachine/kv_store.h"
+#include "statemachine/order_book.h"
 #include "storage/durable_log.h"
 #include "storage/durable_state.h"
 #include "transport/transport.h"
@@ -38,8 +39,8 @@ void handleSignal(int) {
 int usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --id N --config <file> --data-dir <dir> "
-                 "[--fsync every|group] [--wait block|spin] [--batch N] "
-                 "[--linger-us N]\n",
+                 "[--sm kv|orderbook] [--fsync every|group] "
+                 "[--wait block|spin] [--batch N] [--linger-us N]\n",
                  argv0);
     return 2;
 }
@@ -52,6 +53,7 @@ int main(int argc, char** argv) {
     std::string dataDir;
     auto fsyncPolicy = rsm::storage::FsyncPolicy::EveryDurabilityPoint;
     auto waitMode = rsm::runtime::WaitMode::Block;
+    bool orderBook = false;
     long batch = 1;
     long lingerUs = 200;
     for (int i = 1; i < argc; ++i) {
@@ -61,6 +63,15 @@ int main(int argc, char** argv) {
             configPath = argv[++i];
         } else if (std::strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc) {
             dataDir = argv[++i];
+        } else if (std::strcmp(argv[i], "--sm") == 0 && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v == "kv") {
+                orderBook = false;
+            } else if (v == "orderbook") {
+                orderBook = true;
+            } else {
+                return usage(argv[0]);
+            }
         } else if (std::strcmp(argv[i], "--fsync") == 0 && i + 1 < argc) {
             const std::string v = argv[++i];
             if (v == "every") {
@@ -123,7 +134,12 @@ int main(int argc, char** argv) {
                 : "none",
             static_cast<unsigned long long>(log.lastIndex()),
             static_cast<unsigned long long>(log.tornBytesDiscarded()));
-        rsm::statemachine::KVStateMachine sm;
+        std::unique_ptr<rsm::statemachine::StateMachine> sm;
+        if (orderBook) {
+            sm = std::make_unique<rsm::statemachine::OrderBookStateMachine>();
+        } else {
+            sm = std::make_unique<rsm::statemachine::KVStateMachine>();
+        }
         const std::uint64_t seed = std::random_device{}();
         // The runtime is constructed after the core (it needs the core
         // reference), so the core's send hook indirects through this
@@ -138,7 +154,7 @@ int main(int argc, char** argv) {
             if (runtime) runtime->sendFromPipeline(to, m);
             else transport.send(to, m);
         };
-        rsm::raft::RaftCore core(selfId, peerIds, persist, log, sm, clock,
+        rsm::raft::RaftCore core(selfId, peerIds, persist, log, *sm, clock,
                                  seed, rsm::raft::RaftConfig{}, pipelineSend);
         rsm::client::ClientService clientService(core, pipelineSend);
         if (batch > 1) {
@@ -154,7 +170,7 @@ int main(int argc, char** argv) {
         rsm::runtime::NodeRuntimeConfig runtimeCfg;
         runtimeCfg.waitMode = waitMode;
         runtime = std::make_unique<rsm::runtime::NodeRuntime>(
-            core, transport, sm,
+            core, transport, *sm,
             [&clientService](rsm::rpc::LogIndex index,
                              const rsm::rpc::LogEntry& entry,
                              const std::string& result) {
@@ -172,8 +188,10 @@ int main(int argc, char** argv) {
             });
         runtime->start();
         transport.start();
-        std::printf("node %u listening on 127.0.0.1:%u (raft seed %llu)\n",
+        std::printf("node %u listening on 127.0.0.1:%u sm=%s "
+                    "(raft seed %llu)\n",
                     selfId, transport.listenPort(),
+                    orderBook ? "orderbook" : "kv",
                     static_cast<unsigned long long>(seed));
         std::fflush(stdout);
 

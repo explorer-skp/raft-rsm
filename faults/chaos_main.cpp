@@ -20,8 +20,8 @@ namespace {
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s --seed N [--nodes K] [--clients C] "
-                 "[--ops-per-client P]\n"
+                 "usage: %s --seed N [--sm kv|orderbook] [--nodes K] "
+                 "[--clients C] [--ops-per-client P]\n"
                  "          [--fault-end-ms T] [--max-ms T] [--in-memory] "
                  "[--trace]\n",
                  argv0);
@@ -60,6 +60,16 @@ int main(int argc, char** argv) {
             options.faultEndMs = std::atoll(next());
         } else if (arg == "--max-ms") {
             options.maxMs = std::atoll(next());
+        } else if (arg == "--sm") {
+            const std::string v = next();
+            if (v == "kv") {
+                options.sm = rsm::sim::ChaosOptions::Sm::Kv;
+            } else if (v == "orderbook") {
+                options.sm = rsm::sim::ChaosOptions::Sm::OrderBook;
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
         } else if (arg == "--in-memory") {
             options.durableStorage = false;
         } else if (arg == "--trace") {
@@ -75,8 +85,11 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::printf("chaos_sim: nodes=%d clients=%d ops-per-client=%d "
+    std::printf("chaos_sim: sm=%s nodes=%d clients=%d ops-per-client=%d "
                 "fault-end-ms=%lld max-ms=%lld storage=%s\n",
+                options.sm == rsm::sim::ChaosOptions::Sm::OrderBook
+                    ? "orderbook"
+                    : "kv",
                 options.nodes, options.clients, options.opsPerClient,
                 static_cast<long long>(options.faultEndMs),
                 static_cast<long long>(options.maxMs),

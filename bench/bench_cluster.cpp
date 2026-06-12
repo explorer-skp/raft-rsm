@@ -277,7 +277,11 @@ void BenchCluster::buildNode(NodeId id, std::uint64_t incarnation) {
         std::make_unique<rsm::storage::DurablePersistentState>(n.dataDir);
     n.log = std::make_unique<rsm::storage::DurableLog>(n.dataDir, cfg_.fsync);
     n.sm = std::make_unique<StallableSM>(
-        std::make_unique<rsm::statemachine::KVStateMachine>(), stall_);
+        cfg_.orderBook
+            ? std::unique_ptr<rsm::statemachine::StateMachine>(
+                  std::make_unique<rsm::statemachine::OrderBookStateMachine>())
+            : std::make_unique<rsm::statemachine::KVStateMachine>(),
+        stall_);
 
     // Tap state for this incarnation.
     std::fill(n.enq.begin(), n.enq.end(), Node::EnqSlot{});
@@ -372,8 +376,17 @@ std::optional<NodeId> BenchCluster::awaitReady(std::chrono::seconds limit) {
                                 /*maxAttempts=*/2);
     while (std::chrono::steady_clock::now() < deadline) {
         if (monitor_.latestLeader() != 0) {
-            const auto r = probe.put("__ready", "1");
-            if (r && r->status == rsm::statemachine::kKvOk) {
+            // The probe must speak the configured SM's command set. The
+            // order-book probe is a 1-lot bid at the minimum price tick:
+            // it can never cross the workload's price band, and 'O' means
+            // the same thing as the KV put's — committed and applied.
+            const auto r = cfg_.orderBook
+                               ? probe.obNew(rsm::statemachine::ObSide::Bid,
+                                             /*price=*/1, /*qty=*/1)
+                               : probe.put("__ready", "1");
+            const char ok = cfg_.orderBook ? rsm::statemachine::kObOk
+                                           : rsm::statemachine::kKvOk;
+            if (r && r->status == ok) {
                 return monitor_.latestLeader();
             }
         }

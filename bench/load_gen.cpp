@@ -6,10 +6,32 @@
 #include "client/kv_client.h"
 #include "metrics/alloc_gate.h"
 #include "statemachine/kv_store.h"
+#include "statemachine/order_book.h"
 
 namespace rsm::bench {
 
 namespace {
+
+// One workload op: KV PUT (default) or order-book NEW (cfg.orderBook).
+// Returns the committed-and-applied verdict. Both paths are allocation-free
+// in steady state (reused client buffers; integer draws only).
+inline bool issueOne(rsm::client::KvClient& kv, const GenConfig& cfg,
+                     XorShift64& rng, const std::vector<std::string>& keyPool,
+                     const std::string& value) {
+    if (cfg.orderBook) {
+        const auto side =
+            static_cast<rsm::statemachine::ObSide>(rng.next() % 2);
+        const std::uint64_t price =
+            cfg.priceBase - cfg.priceBand +
+            rng.next() % (2 * cfg.priceBand + 1);
+        const std::uint64_t qty = 1 + rng.next() % cfg.qtyMax;
+        const auto r = kv.obNew(side, price, qty);
+        return r.has_value() && r->status == rsm::statemachine::kObOk;
+    }
+    const auto& key = keyPool[nextKeyIndex(rng, cfg.keys)];
+    const auto r = kv.put(key, value);
+    return r.has_value() && r->status == rsm::statemachine::kKvOk;
+}
 
 // All key strings are preformatted before the threads start, so the hot
 // loop only indexes into the pool (allocation-free; the strings outlive the
@@ -52,11 +74,8 @@ GenStats runClosedLoop(const rsm::transport::PeerMap& servers,
                 }
                 const std::uint64_t t0 = nowNs();
                 if (stop == nullptr && t0 >= measureEndNs) break;
-                const auto& key = keyPool[nextKeyIndex(rng, cfg.keys)];
-                const auto r = kv.put(key, value);
+                const bool ok = issueOne(kv, cfg, rng, keyPool, value);
                 const std::uint64_t t1 = nowNs();
-                const bool ok =
-                    r.has_value() && r->status == rsm::statemachine::kKvOk;
                 // Only ops fully inside the window count (standard
                 // closed-loop windowing; partial ops at the edges are
                 // neither latency nor throughput samples).
@@ -126,11 +145,8 @@ GenStats runOpenLoop(const rsm::transport::PeerMap& servers,
                                                         interval, 1) + 1;
                     break;
                 }
-                const auto& key = keyPool[nextKeyIndex(rng, cfg.keys)];
-                const auto r = kv.put(key, value);
+                const bool ok = issueOne(kv, cfg, rng, keyPool, value);
                 const std::uint64_t done = nowNs();
-                const bool ok =
-                    r.has_value() && r->status == rsm::statemachine::kKvOk;
                 if (intended >= measureStartNs) {
                     ++local.scheduled;
                     const std::uint64_t lateness =

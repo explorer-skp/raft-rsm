@@ -1,0 +1,16 @@
+2026-06-12T11:39:54+05:30
+git: d7decc3dda54628a1f4d574422183ba743144d5d
+governor: powersave
+no_turbo: 0
+seed: 1 repeats: 3
+Linux fedora 6.19.14-101.fc42.x86_64 #1 SMP PREEMPT_DYNAMIC Thu May  7 22:39:31 UTC 2026 x86_64 GNU/Linux
+model name	: 12th Gen Intel(R) Core(TM) i5-1235U
+12
+               total        used        free      shared  buff/cache   available
+Mem:           7.4Gi       3.9Gi       1.3Gi       632Mi       3.2Gi       3.5Gi
+Swap:          7.4Gi       1.1Gi       6.3Gi
+2.99 1.83 1.06 3/1308 60961
+CMAKE_BUILD_TYPE:STRING=Release
+CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+//ADVANCED property for variable: CMAKE_CXX_FLAGS_RELEASE
+CMAKE_CXX_FLAGS_RELEASE-ADVANCED:INTERNAL=1
